@@ -3,12 +3,15 @@
  * 管线（顺序有讲究，pass 数随设置变化）：
  *
  *   <video> --importExternalTexture-->
- *     [1] enhance  去块 + 去色带 + 局部对比度   (源分辨率)
- *     [2] easu     方向自适应放大               (→ 目标分辨率)
- *     [3] rcas     自适应锐化
- *     [4] grain    合成胶片颗粒（可选）
- *     [5] badge    状态角标合成（可选）
+ *     [1] enhance    去块 + 去色带 + 局部对比度   (源分辨率)
+ *     [2] 放大       easu / ravu / xlsr           (→ 目标分辨率)
+ *     [3] rcas       自适应锐化
+ *     [4] grain      合成胶片颗粒（可选）
+ *     [5] badge      状态角标合成（可选）
  *   --> <canvas>
+ *
+ * XLSR 档是两段式：先 downscale 到目标÷4，再由 CNN 放大 4 倍。这样任意
+ * 目标倍率都能用 CNN，且 CNN 负担只由目标尺寸决定、不随源分辨率膨胀。
  *
  * 为什么是这个顺序：
  *   - 去块必须在放大前：否则 EASU 会把块边界当真实边缘"保护"，块效应被锐化。
@@ -30,6 +33,7 @@ const SHADERS = {
   easu: chrome.runtime.getURL("src/easu.wgsl"),
   ravu: chrome.runtime.getURL("src/ravu.wgsl"),
   rcas: chrome.runtime.getURL("src/rcas.wgsl"),
+  downscale: chrome.runtime.getURL("src/downscale.wgsl"),
   toTensor: chrome.runtime.getURL("src/to-tensor.wgsl"),
   fromTensor: chrome.runtime.getURL("src/from-tensor.wgsl"),
   grain: chrome.runtime.getURL("src/grain.wgsl"),
@@ -95,6 +99,30 @@ function computeOutputSize(videoW, videoH, mode, maxDim) {
     h: Math.round(videoH * scale),
   };
 }
+
+/* CNN 档的输入尺寸 = 目标尺寸 ÷ 4。
+ *
+ * XLSR 固定 4x（末端 DepthToSpace 把 48 通道重排成 4×4，4 编译在权重里），
+ * 无法配置。要支持任意目标倍率，就先把画面缩放到目标的 1/4，再让 CNN
+ * 放大回来。
+ *
+ * 例：1080p → 2K 时先缩到 640×360，CNN 输出正好 2560×1440。
+ *
+ * 附带的关键收益：CNN 的输入不再随源分辨率膨胀。此前 1080p 选「4 倍」
+ * 会让 CNN 处理 1920×1080→7680×4320（16 倍像素量，实测卡顿）；现在
+ * 无论源多大，CNN 的负担只由目标尺寸决定。
+ *
+ * 也更符合模型的训练分布 —— 它是在低分辨率输入上训练的。
+ */
+function cnnInputSize(outW, outH) {
+  return {
+    w: Math.max(1, Math.round(outW / CNN_SCALE)),
+    h: Math.max(1, Math.round(outH / CNN_SCALE)),
+  };
+}
+
+/** XLSR 的固定放大倍率 */
+const CNN_SCALE = 4;
 
 /* ---------- WebGPU 设备 ---------- */
 
@@ -246,7 +274,7 @@ class Session {
     this.sampler = null;
     this.enhanceUniform = null;
     this.rcasUniform = null;
-    this.intermediates = { enhanced: null, upscaled: null, sharpened: null, pong: null };
+    this.intermediates = { enhanced: null, upscaled: null, sharpened: null, pong: null, cnnInput: null };
     this.rvfcHandle = null;
     this.running = false;
     this.consecutiveFailures = 0;
@@ -260,6 +288,8 @@ class Session {
     this.badgeSize = null;
     this.badgeUniform = null;
     this.grainUniform = null;
+    this.downscaleUniform = null;
+    this.cnnInputSize = null;
     this.ravuLut = null;   // 共享纹理，会话结束不销毁
     this.cnn = null;
     this.activeUpscaler = "EASU";  // 实际生效的放大器，供角标显示
@@ -301,6 +331,10 @@ class Session {
     this.pipelines.easu = this.buildPipeline(
       shaders.easu, "easu", this.interFormat, false,
     );
+    // 高质量降采样，用于 CNN 两段式的预缩放
+    this.pipelines.downscale = this.buildPipeline(
+      shaders.downscale, "downscale", this.interFormat, false,
+    );
     // RAVU 固定 2x，作为 EASU 的可选替代：查表法而非解析近似，更锐
     this.pipelines.ravu = this.buildPipeline(
       shaders.ravu, "ravu", this.interFormat, false,
@@ -330,6 +364,11 @@ class Session {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.rcasUniform = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    // dstWidth, dstHeight, padding — 降采样目标尺寸
+    this.downscaleUniform = device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -586,6 +625,20 @@ class Session {
     this.updateBadge();
   }
 
+  /** CNN 输入纹理按需分配。尺寸未变则复用。 */
+  ensureCnnInput(w, h) {
+    const cur = this.intermediates.cnnInput;
+    if (cur && this.cnnInputSize?.w === w && this.cnnInputSize?.h === h) return;
+    cur?.destroy();
+    this.intermediates.cnnInput = this.device.createTexture({
+      label: "cnn-input",
+      size: [w, h],
+      format: this.interFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.cnnInputSize = { w, h };
+  }
+
   /* ---- 拖动对比 ---- */
 
   setupCompare() {
@@ -762,38 +815,41 @@ class Session {
       // 三种放大器的适用倍率不同：
       //   EASU  任意倍率（解析近似，运行时估边缘方向）
       //   RAVU  仅 2x —— LUT 按 2x 子像素布局训练，非 2x 会索引错位出网格伪影
-      //   XLSR  仅 4x —— 模型结构固定 4 倍，且慢约 30 倍，仅够 30fps
+      //   XLSR  任意倍率 —— 通过"先缩到目标÷4、再 CNN 放大 4 倍"实现
       // 倍率不匹配时静默回落 EASU。
       const scaleX = this.outSize.w / Math.max(1, this.srcSize.w);
       const useRavu = settings.upscaler === "ravu"
         && this.ravuLut != null
         && Math.abs(scaleX - 2) < 0.02;
-      // CNN 按需初始化：26MB 的 wasm 只在用户真正选中该档时才加载
+      // CNN 按需初始化：24MB 的 wasm 只在用户真正选中该档时才加载。
+      // 不再要求特定倍率 —— 两段式对任意目标尺寸都成立。
       if (settings.upscaler === "xlsr" && !this.cnn) {
-        if (Math.abs(scaleX - 4) < 0.02) {
-          this.cnn = await ensureCnn(this.shaders, this.interFormat);
-        } else if (!this.warnedScale) {
-          // 选了 XLSR 但倍率不对是最常见的"为什么没生效" —— 明确告知，
-          // 不要静默回落让用户以为效果不明显
-          this.warnedScale = true;
-          console.warn(
-            `[VidSharp] XLSR 需要恰好 4 倍放大，当前 ${scaleX.toFixed(2)}x ` +
-            `(${this.srcSize.w}×${this.srcSize.h} → ${this.outSize.w}×${this.outSize.h})，` +
-            `已使用 EASU。请把「超分辨率」设为「4 倍放大」。`,
-          );
-          notify("XLSR 需选「4 倍放大」，当前已回退 EASU");
-        }
+        this.cnn = await ensureCnn(this.shaders, this.interFormat);
       }
-      const useCnn = settings.upscaler === "xlsr"
-        && this.cnn?.ready
-        && Math.abs(scaleX - 4) < 0.02;
+      const useCnn = settings.upscaler === "xlsr" && this.cnn?.ready;
 
       let upscaled = false;
       let activeName = "EASU";
       if (useCnn) {
+        // 第一段：缩放到 CNN 需要的输入尺寸（目标÷4）。
+        // 缩小时走高质量区域平均以避免摩尔纹；若源本就小于该尺寸，
+        // downscale shader 内部会退化为双线性放大。
+        const inSize = cnnInputSize(this.outSize.w, this.outSize.h);
+        this.ensureCnnInput(inSize.w, inSize.h);
+        const preEnc = this.device.createCommandEncoder({ label: "cnn-downscale" });
+        this.device.queue.writeBuffer(this.downscaleUniform, 0,
+          new Float32Array([inSize.w, inSize.h, 0, 0]));
+        this.drawPass(preEnc, this.pipelines.downscale, [
+          { binding: 0, resource: this.intermediates.enhanced.createView() },
+          { binding: 1, resource: this.sampler },
+          { binding: 2, resource: { buffer: this.downscaleUniform } },
+        ], this.intermediates.cnnInput.createView());
+        this.device.queue.submit([preEnc.finish()]);
+
+        // 第二段：CNN 放大 4 倍
         upscaled = await this.cnn.upscale(
-          this.intermediates.enhanced,
-          this.srcSize.w, this.srcSize.h,
+          this.intermediates.cnnInput,
+          inSize.w, inSize.h,
           this.intermediates.upscaled,
           encoder,
         );
@@ -916,15 +972,19 @@ class Session {
     this.intermediates.upscaled?.destroy();
     this.intermediates.sharpened?.destroy();
     this.intermediates.pong?.destroy();
-    this.intermediates = { enhanced: null, upscaled: null, sharpened: null, pong: null };
+    this.intermediates.cnnInput?.destroy();
+    this.cnnInputSize = null;
+    this.intermediates = { enhanced: null, upscaled: null, sharpened: null, pong: null, cnnInput: null };
     this.enhanceUniform?.destroy?.();
     this.rcasUniform?.destroy?.();
     this.badgeUniform?.destroy?.();
     this.grainUniform?.destroy?.();
+    this.downscaleUniform?.destroy?.();
     this.enhanceUniform = null;
     this.rcasUniform = null;
     this.badgeUniform = null;
     this.grainUniform = null;
+    this.downscaleUniform = null;
     if (this.patchedParent) {
       this.patchedParent.style.position = "";
       this.patchedParent = null;

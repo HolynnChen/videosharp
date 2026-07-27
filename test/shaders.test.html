@@ -132,7 +132,8 @@
         const mGrain = await compile("grain", false);
         const mBadge = await compile("badge", false);
         const mRavu = await compile("ravu", false);
-        if (!mEnhance || !mEasu || !mRcas || !mGrain || !mBadge || !mRavu) {
+        const mDown = await compile("downscale", false);
+        if (!mEnhance || !mEasu || !mRcas || !mGrain || !mBadge || !mRavu || !mDown) {
           finish("shader-compile-error");
           throw new Error("__handled__");
         }
@@ -590,6 +591,117 @@
             ok(`RAVU 灰度输入无偏色 (最大通道差 ${maxTint})`);
           } else {
             fail(`RAVU 引入偏色: 最大通道差 ${maxTint}`);
+          }
+        }
+
+        /* ======== downscale: 高质量降采样 ========
+         * CNN 两段式的第一段。关键是它必须做区域平均 —— 简单双线性在缩放比
+         * >2 时会漏采样产生摩尔纹，视频上每帧走样位置不同会形成闪烁。
+         * 用高频棋盘图验证：正确的低通会把它平均成接近中灰的均匀色，
+         * 漏采样则会残留明显的明暗块。 */
+        {
+          const SRC = 32, DST = 8;   // 4 倍缩小，与 CNN 两段式的典型比例一致
+          const checker = new Uint8Array(SRC * SRC * 4);
+          for (let y = 0; y < SRC; y++) {
+            for (let x = 0; x < SRC; x++) {
+              const i = (y * SRC + x) * 4;
+              const v = ((x + y) % 2 === 0) ? 0 : 255;   // 逐像素棋盘 = 最高频
+              checker[i] = checker[i + 1] = checker[i + 2] = v;
+              checker[i + 3] = 255;
+            }
+          }
+          const src = makeTexture(SRC, SRC, checker);
+          const dst = makeTexture(DST, DST, null);
+
+          const ub = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          });
+          device.queue.writeBuffer(ub, 0, new Float32Array([DST, DST, 0, 0]));
+
+          const pipe = device.createRenderPipeline({
+            layout: "auto",
+            vertex: { module: mDown, entryPoint: "vs_main" },
+            fragment: { module: mDown, entryPoint: "fs_main",
+                        targets: [{ format: FORMAT }] },
+            primitive: { topology: "triangle-list" },
+          });
+          const enc = device.createCommandEncoder();
+          const pass = enc.beginRenderPass({
+            colorAttachments: [{
+              view: dst.createView(), loadOp: "clear",
+              clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: "store",
+            }],
+          });
+          pass.setPipeline(pipe);
+          pass.setBindGroup(0, device.createBindGroup({
+            layout: pipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: src.createView() },
+              { binding: 1, resource: SAMPLER },
+              { binding: 2, resource: { buffer: ub } },
+            ],
+          }));
+          pass.draw(3);
+          pass.end();
+          device.queue.submit([enc.finish()]);
+
+          const rd = await readback(dst, DST, DST);
+          let mn = 255, mx = 0;
+          for (let y = 1; y < DST - 1; y++) {
+            for (let x = 1; x < DST - 1; x++) {
+              const v = rd(x, y)[0];
+              mn = Math.min(mn, v); mx = Math.max(mx, v);
+            }
+          }
+          // 棋盘均值为 127.5。低通正确时输出应集中在中灰附近；
+          // 漏采样会让某些像素取到纯黑或纯白。
+          if (mx - mn <= 60) {
+            ok(`downscale 抑制了走样 (输出范围 ${mn}~${mx}, 棋盘均值 128)`);
+          } else {
+            fail(`downscale 漏采样: 输出范围 ${mn}~${mx}，跨度过大说明未做区域平均`);
+          }
+          if (mn >= 60 && mx <= 195) {
+            ok(`downscale 均值合理 (${mn}~${mx} 落在中灰区间)`);
+          } else {
+            fail(`downscale 均值偏离: ${mn}~${mx}，期望集中在 128 附近`);
+          }
+
+          // 放大时应退化为双线性（不做区域平均），验证不会误伤放大路径
+          const upDst = makeTexture(SRC, SRC, null);
+          device.queue.writeBuffer(ub, 0, new Float32Array([SRC, SRC, 0, 0]));
+          const enc2 = device.createCommandEncoder();
+          const p2 = enc2.beginRenderPass({
+            colorAttachments: [{
+              view: upDst.createView(), loadOp: "clear",
+              clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: "store",
+            }],
+          });
+          p2.setPipeline(pipe);
+          p2.setBindGroup(0, device.createBindGroup({
+            layout: pipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: src.createView() },
+              { binding: 1, resource: SAMPLER },
+              { binding: 2, resource: { buffer: ub } },
+            ],
+          }));
+          p2.draw(3);
+          p2.end();
+          device.queue.submit([enc2.finish()]);
+          const rdUp = await readback(upDst, SRC, SRC);
+          let upMn = 255, upMx = 0;
+          for (let y = 2; y < SRC - 2; y++) {
+            for (let x = 2; x < SRC - 2; x++) {
+              const v = rdUp(x, y)[0];
+              upMn = Math.min(upMn, v); upMx = Math.max(upMx, v);
+            }
+          }
+          // 等比时应保留原始对比（棋盘仍是黑白分明）
+          if (upMx - upMn >= 150) {
+            ok(`downscale 等比时保留原对比 (${upMn}~${upMx})`);
+          } else {
+            fail(`downscale 等比时误做了模糊: ${upMn}~${upMx}`);
           }
         }
 

@@ -37,6 +37,9 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    // dims 是 CNN 的输出尺寸；渲染目标可能略大（两段式下
+    // round(target/4)*4 与 target 最多差 2 像素，如 480p→2K 的 1442 vs 1440）。
+    // 越界时钳到最后一行/列 —— 差异仅出现在边缘 1~2 像素，视觉不可见。
     let px = vec2<u32>(in.uv * vec2<f32>(f32(dims.width), f32(dims.height)));
     let x = min(px.x, dims.width - 1u);
     let y = min(px.y, dims.height - 1u);
