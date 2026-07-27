@@ -1,4 +1,8 @@
-/* 覆盖层：完全贴合 video 元素，处理成功后才淡入，避免闪黑 */
+/* 覆盖层：完全贴合 video 元素，处理成功后才淡入，避免闪黑
+ *
+ * z-index 取一个足够高的值：B 站等站点的弹幕层、控制条会盖住低层级元素，
+ * 导致 canvas 在渲染但用户看到的仍是原视频。这里压过播放器内部层级，
+ * 但保持 pointer-events: none，控制条依然可点。 */
 .vidsharp-overlay {
   position: absolute;
   inset: 0;
@@ -6,13 +10,18 @@
   height: 100%;
   object-fit: inherit;
   pointer-events: none;
-  z-index: 2;
+  z-index: 2147483000;
   opacity: 0;
   transition: opacity 160ms ease-out;
 }
 
 .vidsharp-overlay.vidsharp-visible {
   opacity: 1;
+}
+
+/* 诊断模式：留出右半边显示原视频，便于左右对比 */
+.vidsharp-overlay.vidsharp-split {
+  clip-path: inset(0 50% 0 0);
 }
 
 .vidsharp-toast {

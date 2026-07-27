@@ -195,6 +195,29 @@
           fail(`噪声抑制反而增强了锐化: ${contrastAfter} → ${dContrast}`);
         }
 
+        // --- 测试 6: 强度单调性
+        // 上一版把面板值映射成 exp2(-stops)，导致 strength=0 时 sharpness 仍为
+        // 0.25、整个区间被压在弱效果段。这里直接验证映射端点与单调性。
+        const strengthToSharpness = (s) => Math.max(0, Math.min(1, s / 100));
+        if (strengthToSharpness(0) === 0 && strengthToSharpness(100) === 1) {
+          ok("强度映射端点正确 (0→0, 100→1)");
+        } else {
+          fail(
+            `强度映射端点错误: 0→${strengthToSharpness(0)}, ` +
+            `100→${strengthToSharpness(100)}`
+          );
+        }
+
+        const weak = await render(strengthToSharpness(25), false);
+        const strong = await render(strengthToSharpness(100), false);
+        const wContrast = px(weak[4], 4)[0] - px(weak[4], 3)[0];
+        const sContrast2 = px(strong[4], 4)[0] - px(strong[4], 3)[0];
+        if (sContrast2 >= wContrast) {
+          ok(`强度单调递增 (25→${wContrast}, 100→${sContrast2})`);
+        } else {
+          fail(`强度非单调: 25→${wContrast} 反而高于 100→${sContrast2}`);
+        }
+
         finish(log.some((l) => l.startsWith("FAIL")) ? "failed" : "passed");
       } catch (err) {
         if (err.message !== "__handled__") {

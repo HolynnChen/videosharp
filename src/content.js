@@ -15,9 +15,11 @@ const SHADER_URL = chrome.runtime.getURL("src/rcas.wgsl");
 
 const DEFAULTS = {
   enabled: false,
-  // 用户面板上的 0~100，映射到 FSR 的 sharpness stops
+  // 用户面板上的 0~100，线性映射到 RCAS sharpness
   strength: 50,
   denoise: true,
+  // 诊断用：只锐化左半边，便于左右对比确认生效
+  splitPreview: false,
 };
 
 let settings = { ...DEFAULTS };
@@ -131,8 +133,35 @@ class Session {
     this.scheduleNext();
   }
 
+  /* 选择挂载点：向上找到仍与 video 尺寸基本一致的最外层祖先。
+   *
+   * 为什么不能直接用 parentElement：B 站等站点的弹幕层、字幕层往往是
+   * video 父元素的兄弟节点，此时无论 canvas 的 z-index 多高都会被盖住
+   * （z-index 只在同一层叠上下文内可比）。挂到共同祖先才能真正盖在最上面。
+   *
+   * 尺寸偏差阈值取 2px，容忍边框和亚像素布局；一旦祖先明显变大就停止，
+   * 避免挂到整个页面上导致覆盖层错位。
+   */
+  pickMountPoint() {
+    const videoRect = this.video.getBoundingClientRect();
+    let best = this.video.parentElement;
+    let node = best;
+
+    for (let depth = 0; node && depth < 4; depth++) {
+      const rect = node.getBoundingClientRect();
+      const fits =
+        Math.abs(rect.width - videoRect.width) <= 2 &&
+        Math.abs(rect.height - videoRect.height) <= 2;
+      if (!fits) break;
+      best = node;
+      node = node.parentElement;
+    }
+
+    return best;
+  }
+
   attachOverlay() {
-    const parent = this.video.parentElement;
+    const parent = this.pickMountPoint();
     if (!parent) throw new Error("video 没有父元素，无法挂载");
 
     // 覆盖层需要一个定位上下文；static 时补成 relative
@@ -142,9 +171,17 @@ class Session {
     }
     parent.appendChild(this.canvas);
 
+    if (settings.splitPreview) {
+      this.canvas.classList.add("vidsharp-split");
+    }
+
     this.resizeObserver = new ResizeObserver(this.onResize);
     this.resizeObserver.observe(this.video);
     this.onResize();
+  }
+
+  applySplitPreview() {
+    this.canvas?.classList.toggle("vidsharp-split", !!settings.splitPreview);
   }
 
   onResize() {
@@ -163,9 +200,10 @@ class Session {
 
   updateUniforms() {
     if (!this.uniformBuffer) return;
-    // 面板 0~100 → FSR stops 2.0(弱) ~ 0.0(强)，再转线性 exp2(-stops)
-    const stops = 2.0 - (settings.strength / 100) * 2.0;
-    const sharpness = Math.pow(2.0, -stops);
+    // 面板 0~100 直接线性映射到 RCAS 的 sharpness 系数 0~1。
+    // 不用 FSR 原版的 exp2(-stops) 曲线：那条曲线为渲染管线的 1~2 stops
+    // 微调设计，映射到 0~100 后整个区间会被压在几乎不可见的弱效果段。
+    const sharpness = Math.max(0, Math.min(1, settings.strength / 100));
     const data = new Float32Array([
       sharpness,
       settings.denoise ? 1.0 : 0.0,
@@ -346,7 +384,10 @@ function init() {
       }
     }
     for (const video of document.querySelectorAll("video")) {
-      active.get(video)?.updateUniforms();
+      const session = active.get(video);
+      if (!session) continue;
+      session.updateUniforms();
+      session.applySplitPreview();
     }
     if (needsReapply) applyToAll();
   });

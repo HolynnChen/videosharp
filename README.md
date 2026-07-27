@@ -40,10 +40,26 @@ RCAS 走的是另一条路：**不生成细节，只把已有细节的对比推�
 | 选项 | 说明 |
 |---|---|
 | 启用锐化 | 全局开关，对所有站点生效 |
-| 强度 | 0~100，映射到 FSR sharpness stops（2.0 → 0.0） |
+| 强度 | 0~100，线性映射到 RCAS sharpness（0 = 无锐化） |
 | 噪声抑制 | 建议保持开启，尤其是低码率视频 |
+| 分屏对比 | 只锐化画面左半边，用于确认效果是否生效 |
 
 设置改动立即生效，无需刷新页面。
+
+## 怎么确认它在工作
+
+打开「分屏对比」，画面左半会被锐化、右半保持原样，中线处应能看到清晰度差异。
+这是最直接的验证方式。
+
+若怀疑没生效，在页面控制台执行：
+
+```js
+// 应返回 1（或视频数量）
+document.querySelectorAll('.vidsharp-overlay').length
+
+// opacity 为 0 表示从未成功渲染过一帧
+getComputedStyle(document.querySelector('.vidsharp-overlay')).opacity
+```
 
 ## 已知限制
 
