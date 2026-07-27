@@ -28,6 +28,7 @@
 const SHADERS = {
   enhance: chrome.runtime.getURL("src/enhance.wgsl"),
   easu: chrome.runtime.getURL("src/easu.wgsl"),
+  ravu: chrome.runtime.getURL("src/ravu.wgsl"),
   rcas: chrome.runtime.getURL("src/rcas.wgsl"),
   grain: chrome.runtime.getURL("src/grain.wgsl"),
   badge: chrome.runtime.getURL("src/badge.wgsl"),
@@ -43,6 +44,7 @@ const DEFAULTS = {
   grain: 0,          // 胶片颗粒 0~100（默认关，需按片源调）
   grainSize: 1.0,    // 颗粒粗细 1~3
   upscale: "2k",     // off | 2k | 4k | 2x
+  upscaler: "easu",  // easu | ravu — 放大算法
   compare: false,    // 拖动对比模式
   badge: "corner",   // off | corner | detail — 增强状态标识
 };
@@ -126,6 +128,32 @@ function getShaders() {
   return shaderCache;
 }
 
+/* RAVU 的滤波系数表。全页面共享一张纹理 —— 它是只读常量，无需按会话复制。 */
+let ravuLutPromise = null;
+function getRavuLut(device) {
+  if (!ravuLutPromise) {
+    ravuLutPromise = (async () => {
+      const url = chrome.runtime.getURL("src/data/ravu-lut.js");
+      const { RAVU_LUT } = await import(url);
+      const bin = Uint8Array.from(atob(RAVU_LUT.data), (c) => c.charCodeAt(0));
+      const tex = device.createTexture({
+        label: "ravu-lut",
+        size: [RAVU_LUT.width, RAVU_LUT.height],
+        format: "rgba16float",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      });
+      device.queue.writeTexture(
+        { texture: tex }, bin,
+        { bytesPerRow: RAVU_LUT.width * 8 },   // 4 通道 × fp16
+        [RAVU_LUT.width, RAVU_LUT.height],
+      );
+      return tex;
+    })();
+    ravuLutPromise.catch(() => { ravuLutPromise = null; });
+  }
+  return ravuLutPromise;
+}
+
 /* ---------- 处理会话 ---------- */
 
 class Session {
@@ -152,6 +180,7 @@ class Session {
     this.badgeSize = null;
     this.badgeUniform = null;
     this.grainUniform = null;
+    this.ravuLut = null;   // 共享纹理，会话结束不销毁
     this.firstFrameDone = false;
     this.renderFrame = this.renderFrame.bind(this);
     this.syncSizes = this.syncSizes.bind(this);
@@ -183,6 +212,10 @@ class Session {
     );
     this.pipelines.easu = this.buildPipeline(
       shaders.easu, "easu", this.interFormat, false,
+    );
+    // RAVU 固定 2x，作为 EASU 的可选替代：查表法而非解析近似，更锐
+    this.pipelines.ravu = this.buildPipeline(
+      shaders.ravu, "ravu", this.interFormat, false,
     );
     this.pipelines.rcas = this.buildPipeline(
       shaders.rcas, "rcas", this.format, true,
@@ -223,6 +256,12 @@ class Session {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.updateUniforms();
+
+    // LUT 加载失败不应让整个会话挂掉 —— 只是 RAVU 档不可用，回落 EASU
+    this.ravuLut = await getRavuLut(device).catch((err) => {
+      console.warn("[VidSharp] RAVU LUT 加载失败，将使用 EASU:", err);
+      return null;
+    });
 
     this.attachOverlay();
     this.running = true;
@@ -355,6 +394,12 @@ class Session {
     if (settings.badge === "detail") {
       const size = upscaled ? `${sw}×${sh} → ${ow}×${oh}` : `${ow}×${oh}`;
       const fx = [];
+      if (upscaled) {
+        const scaleX = ow / Math.max(1, sw);
+        const ravuActive = settings.upscaler === "ravu"
+          && Math.abs(scaleX - 2) < 0.02;
+        fx.push(ravuActive ? "RAVU" : "EASU");
+      }
       if (settings.strength > 0) fx.push(`锐化 ${settings.strength}`);
       if (settings.deblock > 0) fx.push(`去块 ${settings.deblock}`);
       if (settings.deband > 0) fx.push(`去色带 ${settings.deband}`);
@@ -617,11 +662,28 @@ class Session {
         { binding: 2, resource: { buffer: this.enhanceUniform } },
       ], this.intermediates.enhanced.createView());
 
-      // Pass 2: EASU 放大
-      this.drawPass(encoder, this.pipelines.easu, [
-        { binding: 0, resource: this.intermediates.enhanced.createView() },
-        { binding: 1, resource: this.sampler },
-      ], this.intermediates.upscaled.createView());
+      // Pass 2: 放大
+      //
+      // RAVU 固定 2x（LUT 按 2x 子像素布局训练），因此只在目标倍率接近 2
+      // 时启用；其余倍率回落 EASU。这不是妥协 —— 强行用 RAVU 做非 2x 会
+      // 让子像素索引错位，画面出现网格状伪影。
+      const scaleX = this.outSize.w / Math.max(1, this.srcSize.w);
+      const useRavu = settings.upscaler === "ravu"
+        && this.ravuLut != null
+        && Math.abs(scaleX - 2) < 0.02;
+
+      if (useRavu) {
+        this.drawPass(encoder, this.pipelines.ravu, [
+          { binding: 0, resource: this.intermediates.enhanced.createView() },
+          { binding: 1, resource: this.sampler },
+          { binding: 2, resource: this.ravuLut.createView() },
+        ], this.intermediates.upscaled.createView());
+      } else {
+        this.drawPass(encoder, this.pipelines.easu, [
+          { binding: 0, resource: this.intermediates.enhanced.createView() },
+          { binding: 1, resource: this.sampler },
+        ], this.intermediates.upscaled.createView());
+      }
 
       /* 后续 pass 数量随设置变化（grain/角标可开可关），用乒乓纹理串联，
        * 并让最后一个 pass 直接写 canvas 以省一次全屏绘制。

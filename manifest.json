@@ -24,6 +24,8 @@
       "resources": [
         "src/enhance.wgsl",
         "src/easu.wgsl",
+        "src/ravu.wgsl",
+        "src/data/ravu-lut.js",
         "src/rcas.wgsl",
         "src/grain.wgsl",
         "src/badge.wgsl"

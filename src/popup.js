@@ -8,13 +8,14 @@ const DEFAULTS = {
   grain: 0,
   grainSize: 1,
   upscale: "2k",
+  upscaler: "easu",
   compare: false,
   badge: "corner",
 };
 
 const SLIDERS = ["strength", "deblock", "deband", "contrast", "grain", "grainSize"];
 const CHECKBOXES = ["enabled", "denoise", "compare"];
-const SELECTS = ["upscale", "badge"];
+const SELECTS = ["upscale", "upscaler", "badge"];
 
 const el = (id) => document.getElementById(id);
 

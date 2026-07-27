@@ -131,7 +131,8 @@
         const mRcas = await compile("rcas", false);
         const mGrain = await compile("grain", false);
         const mBadge = await compile("badge", false);
-        if (!mEnhance || !mEasu || !mRcas || !mGrain || !mBadge) {
+        const mRavu = await compile("ravu", false);
+        if (!mEnhance || !mEasu || !mRcas || !mGrain || !mBadge || !mRavu) {
           finish("shader-compile-error");
           throw new Error("__handled__");
         }
@@ -486,6 +487,112 @@
           }
         }
 
+        /* ======== RAVU: LUT 查表放大 ========
+         * 用真实 LUT 数据验证：输出有空间变化、动态范围不塌、无 NaN。
+         * RAVU 只调整亮度，故重点看灰度斜边是否被正确重建。 */
+        {
+          const { RAVU_LUT } = await import("../src/data/ravu-lut.js");
+          const bin = Uint8Array.from(atob(RAVU_LUT.data), (c) => c.charCodeAt(0));
+          const expected = RAVU_LUT.width * RAVU_LUT.height * 4 * 2; // rgba fp16
+          if (bin.length === expected) {
+            ok(`RAVU LUT 尺寸正确 (${RAVU_LUT.width}×${RAVU_LUT.height}, ${bin.length}B)`);
+          } else {
+            fail(`RAVU LUT 尺寸错误: ${bin.length}B, 期望 ${expected}B`);
+          }
+
+          const lutTex = device.createTexture({
+            size: [RAVU_LUT.width, RAVU_LUT.height],
+            format: "rgba16float",
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+          });
+          device.queue.writeTexture(
+            { texture: lutTex }, bin,
+            { bytesPerRow: RAVU_LUT.width * 8 },
+            [RAVU_LUT.width, RAVU_LUT.height],
+          );
+
+          const UP = S * 2;
+          const dst = device.createTexture({
+            size: [UP, UP], format: FORMAT,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC
+                 | GPUTextureUsage.TEXTURE_BINDING,
+          });
+          const pipe = device.createRenderPipeline({
+            layout: "auto",
+            vertex: { module: mRavu, entryPoint: "vs_main" },
+            fragment: { module: mRavu, entryPoint: "fs_main", targets: [{ format: FORMAT }] },
+            primitive: { topology: "triangle-list" },
+          });
+          const enc = device.createCommandEncoder();
+          const pass = enc.beginRenderPass({
+            colorAttachments: [{
+              view: dst.createView(), loadOp: "clear",
+              clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: "store",
+            }],
+          });
+          pass.setPipeline(pipe);
+          pass.setBindGroup(0, device.createBindGroup({
+            layout: pipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: edgeTex.createView() },
+              { binding: 1, resource: SAMPLER },
+              { binding: 2, resource: lutTex.createView() },
+            ],
+          }));
+          pass.draw(3);
+          pass.end();
+          device.queue.submit([enc.finish()]);
+
+          const rd = await readback(dst, UP, UP);
+
+          // 动态范围：斜边两侧应仍分得开
+          const dark = rd(2, 2)[0];
+          const bright = rd(UP - 3, UP - 3)[0];
+          if (dark < 90 && bright > 160) {
+            ok(`RAVU 保留动态范围 (暗${dark} 亮${bright})`);
+          } else {
+            fail(`RAVU 动态范围异常: 暗${dark}(期望<90) 亮${bright}(期望>160)`);
+          }
+
+          // 平坦区保真：远离边缘处不应偏离输入太多。
+          // 输入是 40/210 两级，容差取 ±12（RAVU 会锐化，但平坦区不该大改）。
+          // 这条能抓住"整体亮度被 LUT 拉偏"或"暗部被压成纯黑"这类移植错误。
+          let flatErr = 0;
+          for (const [x, y, want] of [[1, 1, 40], [3, 1, 40], [UP-2, UP-2, 210], [UP-4, UP-2, 210]]) {
+            flatErr = Math.max(flatErr, Math.abs(rd(x, y)[0] - want));
+          }
+          if (flatErr <= 12) {
+            ok(`RAVU 平坦区保真 (最大偏差 ${flatErr})`);
+          } else {
+            fail(`RAVU 平坦区偏离过大: ${flatErr} —— 检查 LUT 布局/子像素索引`);
+          }
+
+          // 空间变化（未退化为纯色，也未全黑）
+          let distinct = new Set();
+          for (let y = 0; y < UP; y += 2) {
+            for (let x = 0; x < UP; x += 2) distinct.add(rd(x, y)[0]);
+          }
+          if (distinct.size >= 3) {
+            ok(`RAVU 输出有空间变化 (${distinct.size} 个不同灰阶)`);
+          } else {
+            fail(`RAVU 输出近似纯色 (仅 ${distinct.size} 个灰阶)`);
+          }
+
+          // 灰度输入应保持中性（RAVU 只动亮度，不该引入偏色）
+          let maxTint = 0;
+          for (let y = 2; y < UP - 2; y += 3) {
+            for (let x = 2; x < UP - 2; x += 3) {
+              const p = rd(x, y);
+              maxTint = Math.max(maxTint, Math.abs(p[0] - p[1]), Math.abs(p[1] - p[2]));
+            }
+          }
+          if (maxTint <= 2) {
+            ok(`RAVU 灰度输入无偏色 (最大通道差 ${maxTint})`);
+          } else {
+            fail(`RAVU 引入偏色: 最大通道差 ${maxTint}`);
+          }
+        }
+
         /* ======== 输出尺寸计算（纯逻辑回归） ======== */
         const UPSCALE_TARGETS = { "2k": 2560, "4k": 3840 };
         function computeOutputSize(vw, vh, mode, maxDim) {
@@ -538,6 +645,11 @@
               ? `${src.w}×${src.h} → ${out.w}×${out.h}`
               : `${out.w}×${out.h}`;
             const fx = [];
+            if (upscaled) {
+              const scaleX = out.w / Math.max(1, src.w);
+              const ravuActive = s.upscaler === "ravu" && Math.abs(scaleX - 2) < 0.02;
+              fx.push(ravuActive ? "RAVU" : "EASU");
+            }
             if (s.strength > 0) fx.push(`锐化 ${s.strength}`);
             if (s.deblock > 0) fx.push(`去块 ${s.deblock}`);
             if (s.deband > 0) fx.push(`去色带 ${s.deband}`);
@@ -547,8 +659,9 @@
           return upscaled ? `VidSharp ${out.h}p` : "VidSharp";
         }
 
-        const FULL = { strength: 50, deblock: 40, deband: 30, contrast: 25 };
-        const ZERO = { strength: 0, deblock: 0, deband: 0, contrast: 0 };
+        const FULL = { strength: 50, deblock: 40, deband: 30, contrast: 25, upscaler: "easu" };
+        const ZERO = { strength: 0, deblock: 0, deband: 0, contrast: 0, upscaler: "easu" };
+        const RAVU2X = { strength: 50, deblock: 0, deband: 0, contrast: 0, upscaler: "ravu" };
         const badgeCases = [
           ["off", { w: 1920, h: 1080 }, { w: 2560, h: 1440 }, FULL, null, "关闭时无角标"],
           ["corner", { w: 1920, h: 1080 }, { w: 2560, h: 1440 }, FULL,
@@ -556,8 +669,14 @@
           ["corner", { w: 1920, h: 1080 }, { w: 1920, h: 1080 }, FULL,
             "VidSharp", "未放大时不显示分辨率"],
           ["detail", { w: 1280, h: 720 }, { w: 2560, h: 1440 }, FULL,
-            "VidSharp · 1280×720 → 2560×1440 · 锐化 50 / 去块 40 / 去色带 30 / 对比 25",
-            "详细模式含放大与全部效果"],
+            "VidSharp · 1280×720 → 2560×1440 · EASU / 锐化 50 / 去块 40 / 去色带 30 / 对比 25",
+            "详细模式含放大器与全部效果"],
+          ["detail", { w: 960, h: 540 }, { w: 1920, h: 1080 }, RAVU2X,
+            "VidSharp · 960×540 → 1920×1080 · RAVU / 锐化 50",
+            "2x 时 RAVU 生效"],
+          ["detail", { w: 1280, h: 720 }, { w: 2560, h: 1440 }, RAVU2X,
+            "VidSharp · 1280×720 → 2560×1440 · RAVU / 锐化 50",
+            "720p→2K 恰为 2x, RAVU 生效"],
           ["detail", { w: 1920, h: 1080 }, { w: 1920, h: 1080 }, ZERO,
             "VidSharp · 1920×1080", "全部效果关闭时只显示分辨率"],
         ];
