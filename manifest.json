@@ -27,6 +27,11 @@
         "src/ravu.wgsl",
         "src/data/ravu-lut.js",
         "src/rcas.wgsl",
+        "src/to-tensor.wgsl",
+        "src/from-tensor.wgsl",
+        "src/cnn.js",
+        "models/xlsr-dynamic.onnx",
+        "vendor/ort/*",
         "src/grain.wgsl",
         "src/badge.wgsl"
       ],

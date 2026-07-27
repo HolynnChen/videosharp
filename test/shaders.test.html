@@ -593,12 +593,118 @@
           }
         }
 
+        /* ======== 桥接 shader: texture → NCHW → texture 往返 ========
+         * CNN 档的正确性完全依赖这两个 shader。若布局算错，画面会出现
+         * 通道错位或水平撕裂 —— 而这类错误在 shader 编译期不会报错。
+         * 这里验证往返是恒等的（误差 ≤1 量化级）。 */
+        {
+          const mTo = await compile("to-tensor", false);
+          const mFrom = await compile("from-tensor", false);
+          if (mTo && mFrom) {
+            const W = 8, H = 6;
+            // 每个像素三通道取不同值，能抓出通道错位与行列转置
+            const px = new Uint8Array(W * H * 4);
+            for (let y = 0; y < H; y++) {
+              for (let x = 0; x < W; x++) {
+                const i = (y * W + x) * 4;
+                px[i]     = 20 + x * 25;        // R 随 x 变化
+                px[i + 1] = 40 + y * 30;        // G 随 y 变化
+                px[i + 2] = 200 - x * 10;       // B 反向
+                px[i + 3] = 255;
+              }
+            }
+            const src = makeTexture(W, H, px);
+
+            const dims = device.createBuffer({
+              size: 16,
+              usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(dims, 0, new Uint32Array([W, H, 0, 0]));
+
+            const tensor = device.createBuffer({
+              size: Math.ceil(3 * W * H * 4 / 16) * 16,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+                   | GPUBufferUsage.COPY_DST,
+            });
+
+            // texture → NCHW
+            const cPipe = device.createComputePipeline({
+              layout: "auto",
+              compute: { module: mTo, entryPoint: "main" },
+            });
+            const enc1 = device.createCommandEncoder();
+            const cp = enc1.beginComputePass();
+            cp.setPipeline(cPipe);
+            cp.setBindGroup(0, device.createBindGroup({
+              layout: cPipe.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: src.createView() },
+                { binding: 1, resource: { buffer: tensor } },
+                { binding: 2, resource: { buffer: dims } },
+              ],
+            }));
+            cp.dispatchWorkgroups(Math.ceil(W / 8), Math.ceil(H / 8), 1);
+            cp.end();
+            device.queue.submit([enc1.finish()]);
+
+            // NCHW → texture
+            const dst = makeTexture(W, H, null);
+            const rPipe = device.createRenderPipeline({
+              layout: "auto",
+              vertex: { module: mFrom, entryPoint: "vs_main" },
+              fragment: { module: mFrom, entryPoint: "fs_main",
+                          targets: [{ format: FORMAT }] },
+              primitive: { topology: "triangle-list" },
+            });
+            const enc2 = device.createCommandEncoder();
+            const rp = enc2.beginRenderPass({
+              colorAttachments: [{
+                view: dst.createView(), loadOp: "clear",
+                clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: "store",
+              }],
+            });
+            rp.setPipeline(rPipe);
+            rp.setBindGroup(0, device.createBindGroup({
+              layout: rPipe.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: tensor } },
+                { binding: 1, resource: { buffer: dims } },
+              ],
+            }));
+            rp.draw(3);
+            rp.end();
+            device.queue.submit([enc2.finish()]);
+
+            const rd = await readback(dst, W, H);
+            let maxErr = 0, worst = "";
+            for (let y = 0; y < H; y++) {
+              for (let x = 0; x < W; x++) {
+                const got = rd(x, y);
+                const want = [20 + x * 25, 40 + y * 30, 200 - x * 10];
+                for (let c = 0; c < 3; c++) {
+                  const e = Math.abs(got[c] - want[c]);
+                  if (e > maxErr) {
+                    maxErr = e;
+                    worst = `(${x},${y})ch${c}: ${got[c]} vs ${want[c]}`;
+                  }
+                }
+              }
+            }
+            if (maxErr <= 1) {
+              ok(`桥接往返恒等 (最大误差 ${maxErr})`);
+            } else {
+              fail(`桥接往返失真: 最大误差 ${maxErr} @ ${worst}`);
+            }
+          }
+        }
+
         /* ======== 输出尺寸计算（纯逻辑回归） ======== */
         const UPSCALE_TARGETS = { "2k": 2560, "4k": 3840 };
         function computeOutputSize(vw, vh, mode, maxDim) {
           if (mode === "off" || !vw || !vh) return { w: vw, h: vh };
           let scale;
           if (mode === "2x") scale = 2;
+          else if (mode === "4x") scale = 4;
           else {
             const t = UPSCALE_TARGETS[mode];
             if (!t) return { w: vw, h: vh };
@@ -619,6 +725,8 @@
           [[3840, 2160, "2k", M1_MAX], [3840, 2160], "4K源不缩小"],
           [[1920, 1080, "off", M1_MAX], [1920, 1080], "关闭时原尺寸"],
           [[1920, 1080, "2x", M1_MAX], [3840, 2160], "2倍放大"],
+          [[480, 270, "4x", M1_MAX], [1920, 1080], "4倍放大(XLSR 用)"],
+          [[960, 540, "4x", M1_MAX], [3840, 2160], "540p 4倍→4K"],
           // 4K 源 2x = 7680x4320，仍在 8192 限制内，应正常放大
           [[3840, 2160, "2x", M1_MAX], [7680, 4320], "4K源2倍仍在上限内"],
           // 5K 源 2x 会超限，scale 被钳到 8192/5120=1.6

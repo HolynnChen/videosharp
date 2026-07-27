@@ -30,6 +30,8 @@ const SHADERS = {
   easu: chrome.runtime.getURL("src/easu.wgsl"),
   ravu: chrome.runtime.getURL("src/ravu.wgsl"),
   rcas: chrome.runtime.getURL("src/rcas.wgsl"),
+  toTensor: chrome.runtime.getURL("src/to-tensor.wgsl"),
+  fromTensor: chrome.runtime.getURL("src/from-tensor.wgsl"),
   grain: chrome.runtime.getURL("src/grain.wgsl"),
   badge: chrome.runtime.getURL("src/badge.wgsl"),
 };
@@ -44,7 +46,7 @@ const DEFAULTS = {
   grain: 0,          // 胶片颗粒 0~100（默认关，需按片源调）
   grainSize: 1.0,    // 颗粒粗细 1~3
   upscale: "2k",     // off | 2k | 4k | 2x
-  upscaler: "easu",  // easu | ravu — 放大算法
+  upscaler: "easu",  // easu | ravu | xlsr — 放大算法
   compare: false,    // 拖动对比模式
   badge: "corner",   // off | corner | detail — 增强状态标识
 };
@@ -68,6 +70,10 @@ function computeOutputSize(videoW, videoH, mode, maxDim) {
   let scale;
   if (mode === "2x") {
     scale = 2;
+  } else if (mode === "4x") {
+    // 4x 主要为 XLSR 服务（模型固定 4 倍）；EASU/RAVU 也能用，只是
+    // 4 倍放大后画面偏软，通常还要配合较高锐化
+    scale = 4;
   } else {
     const targetW = UPSCALE_TARGETS[mode];
     if (!targetW) return { w: videoW, h: videoH };
@@ -154,6 +160,33 @@ function getRavuLut(device) {
   return ravuLutPromise;
 }
 
+/* CNN 上采样器按需创建。
+ *
+ * cnn.js 与 26MB 的 ORT wasm 只在用户实际选中 XLSR 档时才加载 —— 默认档
+ * （EASU）完全不碰它们，因此不影响绝大多数使用场景的内存与启动时间。
+ *
+ * 加载或初始化失败时返回一个 ready=false 的占位对象而非抛错：调用方只需
+ * 检查 ready，自然回落 EASU。
+ */
+let cnnModulePromise = null;
+async function ensureCnn(device, shaders, interFormat) {
+  try {
+    if (!cnnModulePromise) {
+      cnnModulePromise = import(chrome.runtime.getURL("src/cnn.js"));
+      cnnModulePromise.catch(() => { cnnModulePromise = null; });
+    }
+    const { CnnUpscaler } = await cnnModulePromise;
+    const up = new CnnUpscaler(device);
+    await up.init(shaders, interFormat);
+    if (up.ready) notify("CNN 超分已启用（实验性）");
+    return up;
+  } catch (err) {
+    console.warn("[VidSharp] CNN 模块加载失败，使用 EASU:", err);
+    notify("CNN 超分不可用，已回退 EASU");
+    return { ready: false, failed: true, dispose() {} };
+  }
+}
+
 /* ---------- 处理会话 ---------- */
 
 class Session {
@@ -181,6 +214,8 @@ class Session {
     this.badgeUniform = null;
     this.grainUniform = null;
     this.ravuLut = null;   // 共享纹理，会话结束不销毁
+    this.cnn = null;
+    this.rendering = false;
     this.firstFrameDone = false;
     this.renderFrame = this.renderFrame.bind(this);
     this.syncSizes = this.syncSizes.bind(this);
@@ -262,6 +297,8 @@ class Session {
       console.warn("[VidSharp] RAVU LUT 加载失败，将使用 EASU:", err);
       return null;
     });
+
+    this.shaders = shaders;   // CNN 按需初始化时要用到桥接 shader
 
     this.attachOverlay();
     this.running = true;
@@ -634,14 +671,18 @@ class Session {
     pass.end();
   }
 
-  renderFrame() {
+  async renderFrame() {
     if (!this.running) return;
+    // CNN 推理是异步的，慢帧可能与下一次 rVFC 回调重叠。重入会让两帧
+    // 争用同一批 GPU buffer，必须丢弃而非排队 —— 视频场景下延迟比完整
+    // 性更重要。
+    if (this.rendering) { this.scheduleNext(); return; }
+    this.rendering = true;
 
     try {
       this.syncSizes();
       if (!this.canvas.width || !this.canvas.height) {
-        this.scheduleNext();
-        return;
+        return;   // finally 会清 rendering，随后由下方 scheduleNext 续上
       }
 
       this.frameCount++;
@@ -653,36 +694,63 @@ class Session {
         source: this.video,
       });
 
-      const encoder = this.device.createCommandEncoder();
-
-      // Pass 1: enhance（源分辨率）
-      this.drawPass(encoder, this.pipelines.enhance, [
+      // Pass 1 单独提交：CNN 档需要 enhance 的结果已经落地才能读取
+      // （ORT 的 run() 是独立命令提交，插不进同一个 encoder）。
+      const preEncoder = this.device.createCommandEncoder({ label: "pre" });
+      this.drawPass(preEncoder, this.pipelines.enhance, [
         { binding: 0, resource: external },
         { binding: 1, resource: this.sampler },
         { binding: 2, resource: { buffer: this.enhanceUniform } },
       ], this.intermediates.enhanced.createView());
+      this.device.queue.submit([preEncoder.finish()]);
+
+      const encoder = this.device.createCommandEncoder();
 
       // Pass 2: 放大
       //
-      // RAVU 固定 2x（LUT 按 2x 子像素布局训练），因此只在目标倍率接近 2
-      // 时启用；其余倍率回落 EASU。这不是妥协 —— 强行用 RAVU 做非 2x 会
-      // 让子像素索引错位，画面出现网格状伪影。
+      // 三种放大器的适用倍率不同：
+      //   EASU  任意倍率（解析近似，运行时估边缘方向）
+      //   RAVU  仅 2x —— LUT 按 2x 子像素布局训练，非 2x 会索引错位出网格伪影
+      //   XLSR  仅 4x —— 模型结构固定 4 倍，且慢约 30 倍，仅够 30fps
+      // 倍率不匹配时静默回落 EASU。
       const scaleX = this.outSize.w / Math.max(1, this.srcSize.w);
       const useRavu = settings.upscaler === "ravu"
         && this.ravuLut != null
         && Math.abs(scaleX - 2) < 0.02;
+      // CNN 按需初始化：26MB 的 wasm 只在用户真正选中该档时才加载
+      if (settings.upscaler === "xlsr" && Math.abs(scaleX - 4) < 0.02
+          && !this.cnn) {
+        this.cnn = await ensureCnn(this.device, this.shaders, this.interFormat);
+      }
+      const useCnn = settings.upscaler === "xlsr"
+        && this.cnn?.ready
+        && Math.abs(scaleX - 4) < 0.02;
 
-      if (useRavu) {
-        this.drawPass(encoder, this.pipelines.ravu, [
-          { binding: 0, resource: this.intermediates.enhanced.createView() },
-          { binding: 1, resource: this.sampler },
-          { binding: 2, resource: this.ravuLut.createView() },
-        ], this.intermediates.upscaled.createView());
-      } else {
-        this.drawPass(encoder, this.pipelines.easu, [
-          { binding: 0, resource: this.intermediates.enhanced.createView() },
-          { binding: 1, resource: this.sampler },
-        ], this.intermediates.upscaled.createView());
+      let upscaled = false;
+      if (useCnn) {
+        upscaled = await this.cnn.upscale(
+          this.intermediates.enhanced,
+          this.srcSize.w, this.srcSize.h,
+          this.intermediates.upscaled,
+          encoder,
+        );
+        // CNN 失败会置 failed，下一帧起自动走 EASU
+        if (!upscaled) notify("CNN 超分不可用，已回退 EASU");
+      }
+
+      if (!upscaled) {
+        if (useRavu) {
+          this.drawPass(encoder, this.pipelines.ravu, [
+            { binding: 0, resource: this.intermediates.enhanced.createView() },
+            { binding: 1, resource: this.sampler },
+            { binding: 2, resource: this.ravuLut.createView() },
+          ], this.intermediates.upscaled.createView());
+        } else {
+          this.drawPass(encoder, this.pipelines.easu, [
+            { binding: 0, resource: this.intermediates.enhanced.createView() },
+            { binding: 1, resource: this.sampler },
+          ], this.intermediates.upscaled.createView());
+        }
       }
 
       /* 后续 pass 数量随设置变化（grain/角标可开可关），用乒乓纹理串联，
@@ -746,13 +814,15 @@ class Session {
         console.warn(
           "[VidSharp] 连续取帧失败，可能是 DRM 保护的视频，已停止处理。", err,
         );
-        this.stop();
+        this.stop();   // 置 running=false，finally 里的 scheduleNext 会自行跳过
         notify("此视频受 DRM 保护，无法处理");
-        return;
       }
+    } finally {
+      // 必须在所有路径上清除，否则一次异常会让渲染永久卡住
+      this.rendering = false;
+      // 也在 finally 里续帧：try 内的早退 return 会跳过函数尾部
+      this.scheduleNext();
     }
-
-    this.scheduleNext();
   }
 
   stop() {
@@ -765,6 +835,9 @@ class Session {
     this.resizeObserver = null;
     this.teardownCompare();
     this.releaseBadgeTexture();
+    // CNN 实例按会话持有（session 与 buffer 都不可共享），需异步释放
+    this.cnn?.dispose();
+    this.cnn = null;
     this.firstFrameDone = false;
     this.canvas?.remove();
     this.canvas = null;
