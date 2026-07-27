@@ -194,6 +194,18 @@ RAVU 把这件事搬到**离线**：训练阶段对大量图像块做分类回�
 故有 `to-tensor.wgsl` / `from-tensor.wgsl` 两个桥接 shader。这一步必须留在
 GPU 上 —— 1080p 经 CPU 往返仅双向拷贝就有 24MB，会把 28ms 推到 100ms+。
 
+**device 必须共享。** WebGPU 规定 buffer/纹理只能用于创建它的 device，而
+ORT 1.27 会自行 `requestDevice()` 且不接受外部传入。混用会报：
+
+```
+[Buffer "cnn-in"] is associated with [Device], and cannot be used with [Device]
+```
+
+解决办法是反过来 —— 先创建一次 session 让 ORT 初始化好 device，再通过
+`ort.env.webgpu.device` 取出来给整条渲染管线用。代价是**切换 CNN 档时整个
+会话要重建**（device 换了，所有 pipeline / 纹理 / canvas context 都失效），
+换来的是全程零拷贝。
+
 ## 安装
 
 需要 Chrome / Edge 113+（WebGPU）。

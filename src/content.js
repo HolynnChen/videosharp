@@ -98,25 +98,66 @@ function computeOutputSize(videoW, videoH, mode, maxDim) {
 
 /* ---------- WebGPU 设备 ---------- */
 
+/* WebGPU device 获取。
+ *
+ * 有两条路径，且不可混用：
+ *   - 纯 shader 档（EASU/RAVU）：自行 requestDevice()
+ *   - CNN 档（XLSR）：必须用 ORT 内部创建的 device
+ *
+ * 原因是 WebGPU 规定 buffer/纹理只能用于创建它的 device，而 ORT 1.27 不
+ * 接受外部传入的 device（只能通过 ort.env.webgpu.device 读取它自己的）。
+ * 混用会报 "[Buffer] is associated with [Device], and cannot be used with
+ * [Device]"。
+ *
+ * 因此切换 CNN 档时整个会话必须重建 —— device 换了，所有 pipeline、纹理、
+ * canvas context 都要跟着换。这个代价换来的是全程零拷贝，值得。
+ */
 let devicePromise = null;
+let deviceIsOrt = false;
+/** ORT 上下文（device + ort + 预热好的 session），仅 CNN 档下非空 */
+let ortCtx = null;
 
-function getDevice() {
+function onDeviceLost(info) {
+  console.warn("[VidSharp] GPU 设备丢失:", info.message);
+  devicePromise = null;
+  deviceIsOrt = false;
+  for (const video of document.querySelectorAll("video")) {
+    active.get(video)?.stop();
+  }
+}
+
+/** @param wantOrt 是否需要 ORT 的 device（CNN 档） */
+function getDevice(wantOrt) {
+  // 需求与当前 device 来源不符时，丢弃重建
+  if (devicePromise && wantOrt !== deviceIsOrt) {
+    devicePromise = null;
+  }
   if (!devicePromise) {
+    deviceIsOrt = wantOrt;
     devicePromise = (async () => {
       if (!navigator.gpu) throw new Error("此浏览器不支持 WebGPU");
+
+      if (wantOrt) {
+        const mod = await import(chrome.runtime.getURL("src/cnn.js"));
+        const ctx = await mod.getOrtDevice();
+        if (ctx) {
+          ctx.device.lost.then(onDeviceLost);
+          ortCtx = ctx;
+          return ctx.device;
+        }
+        // 取不到就退回自建 device，CNN 档随之不可用
+        console.warn("[VidSharp] 无法使用 ORT device，CNN 档不可用");
+        deviceIsOrt = false;
+        ortCtx = null;
+      }
+
       const adapter = await navigator.gpu.requestAdapter();
       if (!adapter) throw new Error("无法获取 GPU adapter");
       const device = await adapter.requestDevice();
-      device.lost.then((info) => {
-        console.warn("[VidSharp] GPU 设备丢失:", info.message);
-        devicePromise = null;
-        for (const video of document.querySelectorAll("video")) {
-          active.get(video)?.stop();
-        }
-      });
+      device.lost.then(onDeviceLost);
       return device;
     })();
-    devicePromise.catch(() => { devicePromise = null; });
+    devicePromise.catch(() => { devicePromise = null; deviceIsOrt = false; });
   }
   return devicePromise;
 }
@@ -136,8 +177,14 @@ function getShaders() {
 
 /* RAVU 的滤波系数表。全页面共享一张纹理 —— 它是只读常量，无需按会话复制。 */
 let ravuLutPromise = null;
+let ravuLutDevice = null;
 function getRavuLut(device) {
+  // 纹理绑定在 device 上：切换 CNN 档会换 device，此时必须重建
+  if (ravuLutPromise && ravuLutDevice !== device) {
+    ravuLutPromise = null;
+  }
   if (!ravuLutPromise) {
+    ravuLutDevice = device;
     ravuLutPromise = (async () => {
       const url = chrome.runtime.getURL("src/data/ravu-lut.js");
       const { RAVU_LUT } = await import(url);
@@ -168,20 +215,20 @@ function getRavuLut(device) {
  * 加载或初始化失败时返回一个 ready=false 的占位对象而非抛错：调用方只需
  * 检查 ready，自然回落 EASU。
  */
-let cnnModulePromise = null;
-async function ensureCnn(device, shaders, interFormat) {
+async function ensureCnn(shaders, interFormat) {
+  // ortCtx 由 getDevice(true) 建立。若为空说明 device 不是 ORT 的，
+  // 此时创建 CnnUpscaler 只会在推理时报跨 device 错误，直接放弃。
+  if (!ortCtx) {
+    return { ready: false, failed: true, dispose() {} };
+  }
   try {
-    if (!cnnModulePromise) {
-      cnnModulePromise = import(chrome.runtime.getURL("src/cnn.js"));
-      cnnModulePromise.catch(() => { cnnModulePromise = null; });
-    }
-    const { CnnUpscaler } = await cnnModulePromise;
-    const up = new CnnUpscaler(device);
+    const mod = await import(chrome.runtime.getURL("src/cnn.js"));
+    const up = new mod.CnnUpscaler(ortCtx);
     await up.init(shaders, interFormat);
     if (up.ready) notify("CNN 超分已启用（实验性）");
     return up;
   } catch (err) {
-    console.warn("[VidSharp] CNN 模块加载失败，使用 EASU:", err);
+    console.warn("[VidSharp] CNN 初始化失败，使用 EASU:", err);
     notify("CNN 超分不可用，已回退 EASU");
     return { ready: false, failed: true, dispose() {} };
   }
@@ -229,7 +276,11 @@ class Session {
       throw new Error("此浏览器不支持 requestVideoFrameCallback");
     }
 
-    const [device, shaders] = await Promise.all([getDevice(), getShaders()]);
+    // CNN 档需要 ORT 的 device —— 二者不可混用，见 getDevice 注释
+    const wantOrt = settings.upscaler === "xlsr";
+    const [device, shaders] = await Promise.all([
+      getDevice(wantOrt), getShaders(),
+    ]);
     this.device = device;
 
     this.canvas = document.createElement("canvas");
@@ -720,7 +771,7 @@ class Session {
       // CNN 按需初始化：26MB 的 wasm 只在用户真正选中该档时才加载
       if (settings.upscaler === "xlsr" && !this.cnn) {
         if (Math.abs(scaleX - 4) < 0.02) {
-          this.cnn = await ensureCnn(this.device, this.shaders, this.interFormat);
+          this.cnn = await ensureCnn(this.shaders, this.interFormat);
         } else if (!this.warnedScale) {
           // 选了 XLSR 但倍率不对是最常见的"为什么没生效" —— 明确告知，
           // 不要静默回落让用户以为效果不明显
@@ -950,6 +1001,7 @@ function init() {
     if (area !== "sync") return;
 
     let reapply = false;
+    let rebuild = false;
     let resize = false;
     let compare = false;
     let badgeMode = false;
@@ -958,6 +1010,12 @@ function init() {
       settings[key] = newValue;
       if (key === "enabled") reapply = true;
       if (key === "upscale") resize = true;
+      // 切换 CNN 档意味着 device 要换（ORT 的 device 不能与自建的混用），
+      // 所有 pipeline/纹理/canvas context 都失效，只能整个会话重建
+      if (key === "upscaler") {
+        const toCnn = newValue === "xlsr";
+        if (toCnn !== deviceIsOrt) rebuild = true;
+      }
       if (key === "compare") compare = true;
       if (key === "badge") badgeMode = true;
     }
@@ -972,7 +1030,16 @@ function init() {
       if (badgeMode) session.refreshBadge();
       else session.updateBadge();
     }
-    if (reapply) applyToAll();
+    if (rebuild) {
+      // 先全部停掉再重建，确保旧 device 上的资源都已释放
+      for (const video of document.querySelectorAll("video")) {
+        active.get(video)?.stop();
+      }
+      ortCtx = null;
+      if (settings.enabled) applyToAll();
+    } else if (reapply) {
+      applyToAll();
+    }
   });
 }
 

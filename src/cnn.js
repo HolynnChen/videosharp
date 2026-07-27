@@ -42,12 +42,46 @@ async function loadOrt() {
   return ortPromise;
 }
 
-/** 单个视频会话的 CNN 上采样器。尺寸变化时重建 session。 */
+/* 取得 ORT 自己创建的 WebGPU device。
+ *
+ * 这是整个 CNN 档最关键的约束：ORT 在首次创建 webgpu session 时会自行
+ * requestDevice()，它不接受外部传入的 device。而 WebGPU 规定 buffer/纹理
+ * 只能用于创建它的那个 device —— 跨 device 使用会报
+ *   [Buffer] is associated with [Device], and cannot be used with [Device]
+ *
+ * 因此不能让 ORT 适配我们的 device，只能反过来：先建一个 session 让 ORT
+ * 初始化好 device，然后整条渲染管线都改用 ort.env.webgpu.device。
+ *
+ * 返回 null 表示 ORT 不可用，调用方应回落纯 shader 路径。
+ */
+export async function getOrtDevice() {
+  try {
+    const ort = await loadOrt();
+    // 创建一次 session 以触发 ORT 内部的 device 初始化
+    const probe = await ort.InferenceSession.create(MODEL_URL, {
+      executionProviders: ["webgpu"],
+      graphOptimizationLevel: "all",
+    });
+    const device = ort.env.webgpu?.device ?? null;
+    if (!device) {
+      await probe.release?.();
+      return null;
+    }
+    // session 留着复用，避免再解析一次模型
+    return { device, ort, session: probe };
+  } catch (err) {
+    console.warn("[VidSharp] 无法取得 ORT 的 WebGPU device:", err);
+    return null;
+  }
+}
+
+/** 单个视频会话的 CNN 上采样器。尺寸变化时无需重建 session（模型是全卷积）。 */
 export class CnnUpscaler {
-  constructor(device) {
-    this.device = device;
-    this.ort = null;
-    this.session = null;
+  /** @param ortCtx getOrtDevice() 的返回值 —— device 必须来自 ORT */
+  constructor(ortCtx) {
+    this.device = ortCtx.device;
+    this.ort = ortCtx.ort;
+    this.session = ortCtx.session;
     this.inSize = { w: 0, h: 0 };
     this.inBuffer = null;
     this.outBuffer = null;
@@ -59,16 +93,10 @@ export class CnnUpscaler {
     this.failed = false;
   }
 
-  /** 加载 ORT 与模型。失败时置 failed，由调用方降级到 EASU。 */
+  /** 编译桥接 shader。ORT 与模型已在 getOrtDevice 阶段就绪。 */
   async init(shaders, interFormat) {
     if (this.failed) return false;
     try {
-      this.ort = await loadOrt();
-      this.session = await this.ort.InferenceSession.create(MODEL_URL, {
-        executionProviders: ["webgpu"],
-        graphOptimizationLevel: "all",
-      });
-
       const dev = this.device;
       const toMod = dev.createShaderModule({
         code: shaders.toTensor, label: "to-tensor",
@@ -97,7 +125,7 @@ export class CnnUpscaler {
       this.ready = true;
       return true;
     } catch (err) {
-      console.warn("[VidSharp] CNN 初始化失败，回退 EASU:", err);
+      console.warn("[VidSharp] CNN 桥接 shader 编译失败，回退 EASU:", err);
       this.failed = true;
       this.ready = false;
       return false;
@@ -237,10 +265,8 @@ export class CnnUpscaler {
   async dispose() {
     this.releaseBuffers();
     this.ready = false;
-    if (this.session) {
-      // release() 返回 Promise，不 await 会导致 WASM 堆未回收
-      try { await this.session.release?.(); } catch { /* 忽略 */ }
-      this.session = null;
-    }
+    // session 属于共享的 ortCtx（多个视频会话复用同一个模型），
+    // 不在此处释放 —— 否则第二个视频会拿到已释放的 session
+    this.session = null;
   }
 }
