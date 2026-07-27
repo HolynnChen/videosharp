@@ -215,6 +215,8 @@ class Session {
     this.grainUniform = null;
     this.ravuLut = null;   // 共享纹理，会话结束不销毁
     this.cnn = null;
+    this.activeUpscaler = "EASU";  // 实际生效的放大器，供角标显示
+    this.warnedScale = false;
     this.rendering = false;
     this.firstFrameDone = false;
     this.renderFrame = this.renderFrame.bind(this);
@@ -357,6 +359,7 @@ class Session {
 
     this.srcSize = { w: vw, h: vh };
     this.outSize = out;
+    this.warnedScale = false;   // 尺寸变了，允许再次提示倍率不匹配
     this.canvas.width = out.w;
     this.canvas.height = out.h;
 
@@ -431,12 +434,9 @@ class Session {
     if (settings.badge === "detail") {
       const size = upscaled ? `${sw}×${sh} → ${ow}×${oh}` : `${ow}×${oh}`;
       const fx = [];
-      if (upscaled) {
-        const scaleX = ow / Math.max(1, sw);
-        const ravuActive = settings.upscaler === "ravu"
-          && Math.abs(scaleX - 2) < 0.02;
-        fx.push(ravuActive ? "RAVU" : "EASU");
-      }
+      // 用渲染循环记录的实际放大器，而非按设置推测 —— 倍率不匹配、
+      // CNN 加载失败等情况都会静默回落，推测会给出错误信息。
+      if (upscaled) fx.push(this.activeUpscaler || "EASU");
       if (settings.strength > 0) fx.push(`锐化 ${settings.strength}`);
       if (settings.deblock > 0) fx.push(`去块 ${settings.deblock}`);
       if (settings.deband > 0) fx.push(`去色带 ${settings.deband}`);
@@ -718,15 +718,27 @@ class Session {
         && this.ravuLut != null
         && Math.abs(scaleX - 2) < 0.02;
       // CNN 按需初始化：26MB 的 wasm 只在用户真正选中该档时才加载
-      if (settings.upscaler === "xlsr" && Math.abs(scaleX - 4) < 0.02
-          && !this.cnn) {
-        this.cnn = await ensureCnn(this.device, this.shaders, this.interFormat);
+      if (settings.upscaler === "xlsr" && !this.cnn) {
+        if (Math.abs(scaleX - 4) < 0.02) {
+          this.cnn = await ensureCnn(this.device, this.shaders, this.interFormat);
+        } else if (!this.warnedScale) {
+          // 选了 XLSR 但倍率不对是最常见的"为什么没生效" —— 明确告知，
+          // 不要静默回落让用户以为效果不明显
+          this.warnedScale = true;
+          console.warn(
+            `[VidSharp] XLSR 需要恰好 4 倍放大，当前 ${scaleX.toFixed(2)}x ` +
+            `(${this.srcSize.w}×${this.srcSize.h} → ${this.outSize.w}×${this.outSize.h})，` +
+            `已使用 EASU。请把「超分辨率」设为「4 倍放大」。`,
+          );
+          notify("XLSR 需选「4 倍放大」，当前已回退 EASU");
+        }
       }
       const useCnn = settings.upscaler === "xlsr"
         && this.cnn?.ready
         && Math.abs(scaleX - 4) < 0.02;
 
       let upscaled = false;
+      let activeName = "EASU";
       if (useCnn) {
         upscaled = await this.cnn.upscale(
           this.intermediates.enhanced,
@@ -735,11 +747,13 @@ class Session {
           encoder,
         );
         // CNN 失败会置 failed，下一帧起自动走 EASU
-        if (!upscaled) notify("CNN 超分不可用，已回退 EASU");
+        if (upscaled) activeName = "XLSR";
+        else notify("CNN 超分不可用，已回退 EASU");
       }
 
       if (!upscaled) {
         if (useRavu) {
+          activeName = "RAVU";
           this.drawPass(encoder, this.pipelines.ravu, [
             { binding: 0, resource: this.intermediates.enhanced.createView() },
             { binding: 1, resource: this.sampler },
@@ -751,6 +765,11 @@ class Session {
             { binding: 1, resource: this.sampler },
           ], this.intermediates.upscaled.createView());
         }
+      }
+      // 放大器变化时刷新角标文案（badgeString 会读 activeUpscaler）
+      if (activeName !== this.activeUpscaler) {
+        this.activeUpscaler = activeName;
+        this.refreshBadge();
       }
 
       /* 后续 pass 数量随设置变化（grain/角标可开可关），用乒乓纹理串联，
