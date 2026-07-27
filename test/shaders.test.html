@@ -309,6 +309,50 @@
         }
         if (sizeOk) ok(`尺寸计算全部正确 (${cases.length} 例)`);
 
+        /* ======== 角标文案生成（纯逻辑） ========
+         * 角标是纯 JS 逻辑，shader 测试覆盖不到 —— 上一版的强度映射错误
+         * 正是这么漏掉的，所以这里补上。 */
+        function badgeText(mode, src, out, s) {
+          if (mode === "off") return null;
+          const upscaled = out.w > src.w;
+          if (mode === "detail") {
+            const size = upscaled
+              ? `${src.w}×${src.h} → ${out.w}×${out.h}`
+              : `${out.w}×${out.h}`;
+            const fx = [];
+            if (s.strength > 0) fx.push(`锐化 ${s.strength}`);
+            if (s.deblock > 0) fx.push(`去块 ${s.deblock}`);
+            if (s.deband > 0) fx.push(`去色带 ${s.deband}`);
+            if (s.contrast > 0) fx.push(`对比 ${s.contrast}`);
+            return `VidSharp · ${size}${fx.length ? " · " + fx.join(" / ") : ""}`;
+          }
+          return upscaled ? `VidSharp ${out.h}p` : "VidSharp";
+        }
+
+        const FULL = { strength: 50, deblock: 40, deband: 30, contrast: 25 };
+        const ZERO = { strength: 0, deblock: 0, deband: 0, contrast: 0 };
+        const badgeCases = [
+          ["off", { w: 1920, h: 1080 }, { w: 2560, h: 1440 }, FULL, null, "关闭时无角标"],
+          ["corner", { w: 1920, h: 1080 }, { w: 2560, h: 1440 }, FULL,
+            "VidSharp 1440p", "简洁模式显示目标高度"],
+          ["corner", { w: 1920, h: 1080 }, { w: 1920, h: 1080 }, FULL,
+            "VidSharp", "未放大时不显示分辨率"],
+          ["detail", { w: 1280, h: 720 }, { w: 2560, h: 1440 }, FULL,
+            "VidSharp · 1280×720 → 2560×1440 · 锐化 50 / 去块 40 / 去色带 30 / 对比 25",
+            "详细模式含放大与全部效果"],
+          ["detail", { w: 1920, h: 1080 }, { w: 1920, h: 1080 }, ZERO,
+            "VidSharp · 1920×1080", "全部效果关闭时只显示分辨率"],
+        ];
+        let badgeOk = true;
+        for (const [mode, src, out, s, want, name] of badgeCases) {
+          const got = badgeText(mode, src, out, s);
+          if (got !== want) {
+            fail(`角标 ${name}: 得到 ${JSON.stringify(got)}, 期望 ${JSON.stringify(want)}`);
+            badgeOk = false;
+          }
+        }
+        if (badgeOk) ok(`角标文案全部正确 (${badgeCases.length} 例)`);
+
         finish(log.some((l) => l.startsWith("FAIL")) ? "failed" : "passed");
       } catch (err) {
         if (err.message !== "__handled__") {

@@ -34,6 +34,7 @@ const DEFAULTS = {
   contrast: 25,      // 局部对比度 0~100
   upscale: "2k",     // off | 2k | 4k | 2x
   compare: false,    // 拖动对比模式
+  badge: "corner",   // off | corner | detail — 增强状态标识
 };
 
 let settings = { ...DEFAULTS };
@@ -136,6 +137,8 @@ class Session {
     this.outSize = { w: 0, h: 0 };
     this.divider = null;
     this.compareRatio = 0.5;
+    this.badge = null;
+    this.firstFrameDone = false;
     this.renderFrame = this.renderFrame.bind(this);
     this.syncSizes = this.syncSizes.bind(this);
   }
@@ -227,6 +230,7 @@ class Session {
     this.resizeObserver = new ResizeObserver(this.syncSizes);
     this.resizeObserver.observe(this.video);
     this.syncSizes();
+    this.setupBadge();
     this.setupCompare();
   }
 
@@ -249,6 +253,7 @@ class Session {
     this.canvas.height = out.h;
 
     this.rebuildIntermediates();
+    this.updateBadge();
   }
 
   rebuildIntermediates() {
@@ -273,6 +278,60 @@ class Session {
       format: interFormat,
       usage,
     });
+  }
+
+  /* ---- 增强状态角标 ----
+   *
+   * 存在的意义：画面被 canvas 接管后，肉眼无法确认看到的是原始视频还是
+   * 增强结果。角标只在首帧真正渲染成功后才出现（见 renderFrame），
+   * 因此它的出现本身就是"增强确实生效"的证据 —— 不是静态装饰。
+   *
+   * 做成独立 DOM 而非画进 canvas：不污染画面像素，截图/录屏时也不会带上。
+   */
+
+  setupBadge() {
+    if (settings.badge === "off") return;
+    const badge = document.createElement("div");
+    badge.className = "vidsharp-badge";
+    this.badge = badge;
+    this.canvas.parentElement?.appendChild(badge);
+    this.updateBadge();
+  }
+
+  updateBadge() {
+    if (!this.badge) return;
+
+    const { w: sw, h: sh } = this.srcSize;
+    const { w: ow, h: oh } = this.outSize;
+    const upscaled = ow > sw;
+
+    if (settings.badge === "detail") {
+      const parts = [];
+      parts.push(upscaled ? `${sw}×${sh} → ${ow}×${oh}` : `${ow}×${oh}`);
+      const fx = [];
+      if (settings.strength > 0) fx.push(`锐化 ${settings.strength}`);
+      if (settings.deblock > 0) fx.push(`去块 ${settings.deblock}`);
+      if (settings.deband > 0) fx.push(`去色带 ${settings.deband}`);
+      if (settings.contrast > 0) fx.push(`对比 ${settings.contrast}`);
+      this.badge.textContent =
+        `VidSharp · ${parts.join("")}${fx.length ? " · " + fx.join(" / ") : ""}`;
+    } else {
+      this.badge.textContent = upscaled ? `VidSharp ${oh}p` : "VidSharp";
+    }
+  }
+
+  teardownBadge() {
+    this.badge?.remove();
+    this.badge = null;
+  }
+
+  refreshBadge() {
+    this.teardownBadge();
+    if (settings.badge !== "off" && this.canvas?.parentElement) {
+      this.setupBadge();
+      // 已经在渲染中的会话要立刻显示，不必等下一次首帧
+      if (this.firstFrameDone) this.badge?.classList.add("vidsharp-visible");
+    }
   }
 
   /* ---- 拖动对比 ---- */
@@ -447,6 +506,11 @@ class Session {
 
       this.consecutiveFailures = 0;
       this.canvas.classList.add("vidsharp-visible");
+      // 角标在首帧成功后才显示 —— 它的出现即证明增强真的生效
+      if (!this.firstFrameDone) {
+        this.firstFrameDone = true;
+        this.badge?.classList.add("vidsharp-visible");
+      }
     } catch (err) {
       this.consecutiveFailures++;
       if (this.consecutiveFailures >= 5) {
@@ -471,6 +535,8 @@ class Session {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.teardownCompare();
+    this.teardownBadge();
+    this.firstFrameDone = false;
     this.canvas?.remove();
     this.canvas = null;
     this.ctx = null;
@@ -559,12 +625,14 @@ function init() {
     let reapply = false;
     let resize = false;
     let compare = false;
+    let badgeMode = false;
     for (const [key, { newValue }] of Object.entries(changes)) {
       if (!(key in DEFAULTS)) continue;
       settings[key] = newValue;
       if (key === "enabled") reapply = true;
       if (key === "upscale") resize = true;
       if (key === "compare") compare = true;
+      if (key === "badge") badgeMode = true;
     }
 
     for (const video of document.querySelectorAll("video")) {
@@ -573,6 +641,9 @@ function init() {
       session.updateUniforms();
       if (resize) session.syncSizes();
       if (compare) session.refreshCompare();
+      // 角标模式切换要重建元素；其余参数变化只需刷新文案
+      if (badgeMode) session.refreshBadge();
+      else session.updateBadge();
     }
     if (reapply) applyToAll();
   });

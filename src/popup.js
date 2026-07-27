@@ -7,10 +7,12 @@ const DEFAULTS = {
   contrast: 25,
   upscale: "2k",
   compare: false,
+  badge: "corner",
 };
 
 const SLIDERS = ["strength", "deblock", "deband", "contrast"];
 const CHECKBOXES = ["enabled", "denoise", "compare"];
+const SELECTS = ["upscale", "badge"];
 
 const el = (id) => document.getElementById(id);
 
@@ -24,11 +26,11 @@ function syncEnabledState(enabled) {
 
 chrome.storage.sync.get(DEFAULTS, (stored) => {
   for (const id of CHECKBOXES) el(id).checked = stored[id];
+  for (const id of SELECTS) el(id).value = stored[id];
   for (const id of SLIDERS) {
     el(id).value = stored[id];
     el(`${id}Value`).textContent = stored[id];
   }
-  el("upscale").value = stored.upscale;
   syncEnabledState(stored.enabled);
 });
 
@@ -40,6 +42,12 @@ for (const id of CHECKBOXES) {
   });
 }
 
+for (const id of SELECTS) {
+  el(id).addEventListener("change", () => {
+    chrome.storage.sync.set({ [id]: el(id).value });
+  });
+}
+
 for (const id of SLIDERS) {
   el(id).addEventListener("input", () => {
     const value = Number(el(id).value);
@@ -47,7 +55,3 @@ for (const id of SLIDERS) {
     chrome.storage.sync.set({ [id]: value });
   });
 }
-
-el("upscale").addEventListener("change", () => {
-  chrome.storage.sync.set({ upscale: el("upscale").value });
-});
