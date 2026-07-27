@@ -129,7 +129,8 @@
         const mEnhance = await compile("enhance", true);
         const mEasu = await compile("easu", false);
         const mRcas = await compile("rcas", false);
-        if (!mEnhance || !mEasu || !mRcas) {
+        const mBadge = await compile("badge", false);
+        if (!mEnhance || !mEasu || !mRcas || !mBadge) {
           finish("shader-compile-error");
           throw new Error("__handled__");
         }
@@ -266,6 +267,125 @@
           ok("强度映射端点正确 (0→0, 100→1)");
         } else {
           fail(`强度映射端点错误: 0→${map(0)}, 100→${map(100)}`);
+        }
+
+        /* ======== badge: 合成正确性 ========
+         * 关键性质：角标矩形外的像素必须逐位不变（否则会污染整幅画面）；
+         * 矩形内必须真的被改变（否则角标不可见，失去指示意义）。 */
+        {
+          const bw = 8, bh = 4;
+          // 角标纹理：全不透明的纯红
+          const badgePixels = new Uint8Array(bw * bh * 4);
+          for (let i = 0; i < bw * bh; i++) {
+            badgePixels[i * 4] = 255;
+            badgePixels[i * 4 + 3] = 255;
+          }
+          const badgeTex = makeTexture(bw, bh, badgePixels);
+
+          // 底图：均匀灰
+          const grayPixels = new Uint8Array(S * S * 4);
+          for (let i = 0; i < S * S; i++) {
+            grayPixels[i * 4] = grayPixels[i * 4 + 1] = grayPixels[i * 4 + 2] = 100;
+            grayPixels[i * 4 + 3] = 255;
+          }
+          const baseTex = makeTexture(S, S, grayPixels);
+          const dst = makeTexture(S, S, null);
+
+          // 角标置于右上角：x=0.5, y=0, w=0.5, h=0.25 → 覆盖 x∈[8,16), y∈[0,4)
+          const ub = device.createBuffer({
+            size: 32,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          });
+          device.queue.writeBuffer(ub, 0, new Float32Array([
+            0.5, 0.0, 0.5, 0.25,
+            1.0, 0, 0, 0,
+          ]));
+
+          const pipeline = device.createRenderPipeline({
+            layout: "auto",
+            vertex: { module: mBadge, entryPoint: "vs_main" },
+            fragment: { module: mBadge, entryPoint: "fs_main", targets: [{ format: FORMAT }] },
+            primitive: { topology: "triangle-list" },
+          });
+          const enc = device.createCommandEncoder();
+          const pass = enc.beginRenderPass({
+            colorAttachments: [{
+              view: dst.createView(),
+              loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              storeOp: "store",
+            }],
+          });
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: baseTex.createView() },
+              { binding: 1, resource: SAMPLER },
+              { binding: 2, resource: badgeTex.createView() },
+              { binding: 3, resource: { buffer: ub } },
+            ],
+          }));
+          pass.draw(3);
+          pass.end();
+          device.queue.submit([enc.finish()]);
+
+          const bg = await readback(dst, S, S);
+
+          // 矩形内应变红
+          const inside = bg(12, 2);
+          if (inside[0] > 200 && inside[1] < 60) {
+            ok(`badge 矩形内已合成 (rgb ${inside.join(",")})`);
+          } else {
+            fail(`badge 矩形内未合成: rgb ${inside.join(",")}, 期望偏红`);
+          }
+
+          // 矩形外必须完全不变
+          let outsideMaxDev = 0;
+          const probes = [[2, 2], [4, 10], [12, 10], [1, 15], [15, 15]];
+          for (const [x, y] of probes) {
+            const p = bg(x, y);
+            outsideMaxDev = Math.max(outsideMaxDev,
+              Math.abs(p[0] - 100), Math.abs(p[1] - 100), Math.abs(p[2] - 100));
+          }
+          if (outsideMaxDev <= 2) {
+            ok(`badge 矩形外未受影响 (最大偏差 ${outsideMaxDev})`);
+          } else {
+            fail(`badge 污染了矩形外区域: 最大偏差 ${outsideMaxDev}`);
+          }
+
+          // opacity=0 时应完全等于底图
+          const dst2 = makeTexture(S, S, null);
+          device.queue.writeBuffer(ub, 0, new Float32Array([
+            0.5, 0.0, 0.5, 0.25, 0.0, 0, 0, 0,
+          ]));
+          const enc2 = device.createCommandEncoder();
+          const pass2 = enc2.beginRenderPass({
+            colorAttachments: [{
+              view: dst2.createView(),
+              loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              storeOp: "store",
+            }],
+          });
+          pass2.setPipeline(pipeline);
+          pass2.setBindGroup(0, device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: baseTex.createView() },
+              { binding: 1, resource: SAMPLER },
+              { binding: 2, resource: badgeTex.createView() },
+              { binding: 3, resource: { buffer: ub } },
+            ],
+          }));
+          pass2.draw(3);
+          pass2.end();
+          device.queue.submit([enc2.finish()]);
+          const bg2 = await readback(dst2, S, S);
+          const zeroOp = bg2(12, 2);
+          if (Math.abs(zeroOp[0] - 100) <= 2) {
+            ok(`badge opacity=0 时恒等 (${zeroOp[0]})`);
+          } else {
+            fail(`badge opacity=0 仍改变了画面: ${zeroOp[0]}`);
+          }
         }
 
         /* ======== 输出尺寸计算（纯逻辑回归） ======== */

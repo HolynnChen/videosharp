@@ -24,7 +24,8 @@
       "resources": [
         "src/enhance.wgsl",
         "src/easu.wgsl",
-        "src/rcas.wgsl"
+        "src/rcas.wgsl",
+        "src/badge.wgsl"
       ],
       "matches": ["<all_urls>"]
     }

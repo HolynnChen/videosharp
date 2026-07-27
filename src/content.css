@@ -19,42 +19,6 @@
   opacity: 1;
 }
 
-/* 增强状态角标
- *
- * 放在左上角而非右上/右下：多数播放器把清晰度、画中画、设置等控件放在
- * 右侧和底部，左上角冲突最少。
- * 与覆盖层同层级（z-index: 1）——只需压过 video，不遮挡播放器 UI。
- * 默认半透明，鼠标悬停在播放器上时才完全显现，避免长期干扰观看。 */
-.vidsharp-badge {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  z-index: 1;
-  max-width: calc(100% - 20px);
-  padding: 3px 8px;
-  border-radius: 4px;
-  background: rgba(16, 16, 20, 0.62);
-  color: #7ee0c0;
-  font: 500 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  letter-spacing: 0.02em;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 200ms ease-out;
-}
-
-.vidsharp-badge.vidsharp-visible {
-  opacity: 0.55;
-}
-
-/* 鼠标移到播放器上时提高可读性（角标自身 pointer-events: none，
- * 所以只能靠父容器的 hover 状态触发） */
-*:hover > .vidsharp-badge.vidsharp-visible {
-  opacity: 0.92;
-}
-
 /* 拖动对比分割条 —— 需要接收指针事件，所以比覆盖层高一级 */
 .vidsharp-divider {
   position: absolute;

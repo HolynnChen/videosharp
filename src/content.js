@@ -23,6 +23,7 @@ const SHADERS = {
   enhance: chrome.runtime.getURL("src/enhance.wgsl"),
   easu: chrome.runtime.getURL("src/easu.wgsl"),
   rcas: chrome.runtime.getURL("src/rcas.wgsl"),
+  badge: chrome.runtime.getURL("src/badge.wgsl"),
 };
 
 const DEFAULTS = {
@@ -128,7 +129,7 @@ class Session {
     this.sampler = null;
     this.enhanceUniform = null;
     this.rcasUniform = null;
-    this.intermediates = { enhanced: null, upscaled: null };
+    this.intermediates = { enhanced: null, upscaled: null, sharpened: null };
     this.rvfcHandle = null;
     this.running = false;
     this.consecutiveFailures = 0;
@@ -137,7 +138,10 @@ class Session {
     this.outSize = { w: 0, h: 0 };
     this.divider = null;
     this.compareRatio = 0.5;
-    this.badge = null;
+    this.badgeTexture = null;
+    this.badgeText = null;
+    this.badgeSize = null;
+    this.badgeUniform = null;
     this.firstFrameDone = false;
     this.renderFrame = this.renderFrame.bind(this);
     this.syncSizes = this.syncSizes.bind(this);
@@ -173,6 +177,11 @@ class Session {
     this.pipelines.rcas = this.buildPipeline(
       shaders.rcas, "rcas", this.format, true,
     );
+    // 角标合成 pass 直接输出到 canvas，故用 canvas 格式；
+    // 它的输入是 RCAS 已锐化的画面，也用同一格式以避免多余转换。
+    this.pipelines.badge = this.buildPipeline(
+      shaders.badge, "badge", this.format, false,
+    );
 
     this.sampler = device.createSampler({
       magFilter: "linear",
@@ -187,6 +196,11 @@ class Session {
     });
     this.rcasUniform = device.createBuffer({
       size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    // rect(vec4) + opacity + 3 padding = 8 x f32
+    this.badgeUniform = device.createBuffer({
+      size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.updateUniforms();
@@ -230,7 +244,6 @@ class Session {
     this.resizeObserver = new ResizeObserver(this.syncSizes);
     this.resizeObserver.observe(this.video);
     this.syncSizes();
-    this.setupBadge();
     this.setupCompare();
   }
 
@@ -253,13 +266,15 @@ class Session {
     this.canvas.height = out.h;
 
     this.rebuildIntermediates();
-    this.updateBadge();
+    // 分辨率变了，角标字号与位置都要重算 —— 必须重建而非复用旧纹理
+    this.refreshBadge();
   }
 
   rebuildIntermediates() {
     const { device, interFormat } = this;
     this.intermediates.enhanced?.destroy();
     this.intermediates.upscaled?.destroy();
+    this.intermediates.sharpened?.destroy();
 
     const usage =
       GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
@@ -278,60 +293,135 @@ class Session {
       format: interFormat,
       usage,
     });
+
+    // 角标启用时 RCAS 的落点。格式必须与 rcas pipeline 的 target 一致
+    // （即 canvas 格式），否则 render pass 校验失败。
+    this.intermediates.sharpened = device.createTexture({
+      label: "sharpened",
+      size: [this.outSize.w, this.outSize.h],
+      format: this.format,
+      usage,
+    });
   }
 
   /* ---- 增强状态角标 ----
    *
    * 存在的意义：画面被 canvas 接管后，肉眼无法确认看到的是原始视频还是
-   * 增强结果。角标只在首帧真正渲染成功后才出现（见 renderFrame），
-   * 因此它的出现本身就是"增强确实生效"的证据 —— 不是静态装饰。
+   * 增强结果。
    *
-   * 做成独立 DOM 而非画进 canvas：不污染画面像素，截图/录屏时也不会带上。
+   * 为什么画进 canvas 而不用独立 DOM 元素：
+   *   独立角标与 canvas 是两个元素，会被站点的不同层级分别遮挡 ——
+   *   出现"角标可见但 canvas 被挡"的情况，指示就成了误导。
+   *   合成进画面后，看得见角标 ⟺ 看得见增强结果，无法解耦。
+   *
+   * 文字用 2D canvas 预渲染成纹理，仅在文案变化时重建；每帧只做一次
+   * alpha 混合，开销可忽略。
    */
 
-  setupBadge() {
-    if (settings.badge === "off") return;
-    const badge = document.createElement("div");
-    badge.className = "vidsharp-badge";
-    this.badge = badge;
-    this.canvas.parentElement?.appendChild(badge);
-    this.updateBadge();
-  }
-
-  updateBadge() {
-    if (!this.badge) return;
-
+  badgeString() {
     const { w: sw, h: sh } = this.srcSize;
     const { w: ow, h: oh } = this.outSize;
     const upscaled = ow > sw;
 
     if (settings.badge === "detail") {
-      const parts = [];
-      parts.push(upscaled ? `${sw}×${sh} → ${ow}×${oh}` : `${ow}×${oh}`);
+      const size = upscaled ? `${sw}×${sh} → ${ow}×${oh}` : `${ow}×${oh}`;
       const fx = [];
       if (settings.strength > 0) fx.push(`锐化 ${settings.strength}`);
       if (settings.deblock > 0) fx.push(`去块 ${settings.deblock}`);
       if (settings.deband > 0) fx.push(`去色带 ${settings.deband}`);
       if (settings.contrast > 0) fx.push(`对比 ${settings.contrast}`);
-      this.badge.textContent =
-        `VidSharp · ${parts.join("")}${fx.length ? " · " + fx.join(" / ") : ""}`;
-    } else {
-      this.badge.textContent = upscaled ? `VidSharp ${oh}p` : "VidSharp";
+      return `VidSharp · ${size}${fx.length ? " · " + fx.join(" / ") : ""}`;
     }
+    return upscaled ? `VidSharp ${oh}p` : "VidSharp";
   }
 
-  teardownBadge() {
-    this.badge?.remove();
-    this.badge = null;
+  /** 把文案渲染成 GPU 纹理。文案未变则直接复用。 */
+  updateBadge() {
+    if (!this.device) return;
+
+    if (settings.badge === "off") {
+      this.releaseBadgeTexture();
+      return;
+    }
+    if (!this.outSize.w) return;
+
+    const text = this.badgeString();
+    if (text === this.badgeText && this.badgeTexture) return;
+    this.badgeText = text;
+
+    // 字号跟随输出分辨率，保证不同分辨率下视觉大小一致
+    const scale = Math.max(1, Math.min(3, this.outSize.h / 720));
+    const fontSize = Math.round(13 * scale);
+    const padX = Math.round(9 * scale);
+    const padY = Math.round(5 * scale);
+    const radius = Math.round(5 * scale);
+
+    const measure = document.createElement("canvas").getContext("2d");
+    const font = `500 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, ` +
+                 `Consolas, "Courier New", monospace`;
+    measure.font = font;
+    const textW = Math.ceil(measure.measureText(text).width);
+
+    const w = textW + padX * 2;
+    const h = Math.round(fontSize * 1.5) + padY * 2;
+
+    const c2d = document.createElement("canvas");
+    c2d.width = w;
+    c2d.height = h;
+    const ctx = c2d.getContext("2d");
+
+    // 背景圆角矩形
+    ctx.fillStyle = "rgba(16, 16, 20, 0.68)";
+    ctx.beginPath();
+    ctx.roundRect(0, 0, w, h, radius);
+    ctx.fill();
+
+    ctx.font = font;
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#7ee0c0";
+    ctx.fillText(text, padX, h / 2);
+
+    this.releaseBadgeTexture();
+    this.badgeTexture = this.device.createTexture({
+      label: "badge",
+      size: [w, h],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+           | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    this.device.queue.copyExternalImageToTexture(
+      { source: c2d },
+      { texture: this.badgeTexture, premultipliedAlpha: false },
+      [w, h],
+    );
+    this.badgeSize = { w, h };
+    this.writeBadgeUniform();
+  }
+
+  writeBadgeUniform() {
+    if (!this.badgeUniform || !this.badgeSize || !this.outSize.w) return;
+    // 右上角，边距随分辨率缩放
+    const margin = Math.round(12 * Math.max(1, this.outSize.h / 720));
+    const { w: bw, h: bh } = this.badgeSize;
+    const x = (this.outSize.w - bw - margin) / this.outSize.w;
+    const y = margin / this.outSize.h;
+    this.device.queue.writeBuffer(this.badgeUniform, 0, new Float32Array([
+      x, y, bw / this.outSize.w, bh / this.outSize.h,
+      0.82, 0, 0, 0,
+    ]));
+  }
+
+  releaseBadgeTexture() {
+    this.badgeTexture?.destroy();
+    this.badgeTexture = null;
+    this.badgeText = null;
+    this.badgeSize = null;
   }
 
   refreshBadge() {
-    this.teardownBadge();
-    if (settings.badge !== "off" && this.canvas?.parentElement) {
-      this.setupBadge();
-      // 已经在渲染中的会话要立刻显示，不必等下一次首帧
-      if (this.firstFrameDone) this.badge?.classList.add("vidsharp-visible");
-    }
+    // 模式切换只需重算纹理；合成与否由 renderFrame 依 badgeTexture 判断
+    this.releaseBadgeTexture();
+    this.updateBadge();
   }
 
   /* ---- 拖动对比 ---- */
@@ -495,22 +585,34 @@ class Session {
         { binding: 1, resource: this.sampler },
       ], this.intermediates.upscaled.createView());
 
-      // Pass 3: RCAS 锐化 → canvas
+      // Pass 3: RCAS 锐化。有角标时先渲到中间纹理，留给 Pass 4 合成；
+      // 无角标时直接出到 canvas，省一次全屏绘制。
+      const withBadge = !!this.badgeTexture;
+      const rcasTarget = withBadge
+        ? this.intermediates.sharpened.createView()
+        : this.ctx.getCurrentTexture().createView();
+
       this.drawPass(encoder, this.pipelines.rcas, [
         { binding: 0, resource: this.intermediates.upscaled.createView() },
         { binding: 1, resource: this.sampler },
         { binding: 2, resource: { buffer: this.rcasUniform } },
-      ], this.ctx.getCurrentTexture().createView());
+      ], rcasTarget);
+
+      // Pass 4: 角标合成 → canvas
+      if (withBadge) {
+        this.drawPass(encoder, this.pipelines.badge, [
+          { binding: 0, resource: this.intermediates.sharpened.createView() },
+          { binding: 1, resource: this.sampler },
+          { binding: 2, resource: this.badgeTexture.createView() },
+          { binding: 3, resource: { buffer: this.badgeUniform } },
+        ], this.ctx.getCurrentTexture().createView());
+      }
 
       this.device.queue.submit([encoder.finish()]);
 
       this.consecutiveFailures = 0;
       this.canvas.classList.add("vidsharp-visible");
-      // 角标在首帧成功后才显示 —— 它的出现即证明增强真的生效
-      if (!this.firstFrameDone) {
-        this.firstFrameDone = true;
-        this.badge?.classList.add("vidsharp-visible");
-      }
+      this.firstFrameDone = true;
     } catch (err) {
       this.consecutiveFailures++;
       if (this.consecutiveFailures >= 5) {
@@ -535,18 +637,21 @@ class Session {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.teardownCompare();
-    this.teardownBadge();
+    this.releaseBadgeTexture();
     this.firstFrameDone = false;
     this.canvas?.remove();
     this.canvas = null;
     this.ctx = null;
     this.intermediates.enhanced?.destroy();
     this.intermediates.upscaled?.destroy();
-    this.intermediates = { enhanced: null, upscaled: null };
+    this.intermediates.sharpened?.destroy();
+    this.intermediates = { enhanced: null, upscaled: null, sharpened: null };
     this.enhanceUniform?.destroy?.();
     this.rcasUniform?.destroy?.();
+    this.badgeUniform?.destroy?.();
     this.enhanceUniform = null;
     this.rcasUniform = null;
+    this.badgeUniform = null;
     if (this.patchedParent) {
       this.patchedParent.style.position = "";
       this.patchedParent = null;
