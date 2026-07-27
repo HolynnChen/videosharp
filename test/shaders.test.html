@@ -129,8 +129,9 @@
         const mEnhance = await compile("enhance", true);
         const mEasu = await compile("easu", false);
         const mRcas = await compile("rcas", false);
+        const mGrain = await compile("grain", false);
         const mBadge = await compile("badge", false);
-        if (!mEnhance || !mEasu || !mRcas || !mBadge) {
+        if (!mEnhance || !mEasu || !mRcas || !mGrain || !mBadge) {
           finish("shader-compile-error");
           throw new Error("__handled__");
         }
@@ -385,6 +386,103 @@
             ok(`badge opacity=0 时恒等 (${zeroOp[0]})`);
           } else {
             fail(`badge opacity=0 仍改变了画面: ${zeroOp[0]}`);
+          }
+        }
+
+        /* ======== grain: 合成颗粒 ========
+         * 三个关键性质：strength=0 恒等；纯黑/纯白不加颗粒（否则显脏）；
+         * 中间调确实加了颗粒（否则功能无效）。 */
+        {
+          const mkPipe = () => device.createRenderPipeline({
+            layout: "auto",
+            vertex: { module: mGrain, entryPoint: "vs_main" },
+            fragment: { module: mGrain, entryPoint: "fs_main", targets: [{ format: FORMAT }] },
+            primitive: { topology: "triangle-list" },
+          });
+          const pipe = mkPipe();
+
+          async function grainRun(level, strength) {
+            const px = new Uint8Array(S * S * 4);
+            for (let i = 0; i < S * S; i++) {
+              px[i*4] = px[i*4+1] = px[i*4+2] = level;
+              px[i*4+3] = 255;
+            }
+            const src = makeTexture(S, S, px);
+            const dst = makeTexture(S, S, null);
+            const ub = device.createBuffer({
+              size: 16,
+              usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            // strength, size, frameSeed, chroma
+            device.queue.writeBuffer(ub, 0, new Float32Array([strength, 1, 7, 0]));
+            const enc = device.createCommandEncoder();
+            const pass = enc.beginRenderPass({
+              colorAttachments: [{
+                view: dst.createView(), loadOp: "clear",
+                clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: "store",
+              }],
+            });
+            pass.setPipeline(pipe);
+            pass.setBindGroup(0, device.createBindGroup({
+              layout: pipe.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: src.createView() },
+                { binding: 1, resource: SAMPLER },
+                { binding: 2, resource: { buffer: ub } },
+              ],
+            }));
+            pass.draw(3);
+            pass.end();
+            device.queue.submit([enc.finish()]);
+            const rd = await readback(dst, S, S);
+            let maxDev = 0, varied = 0;
+            for (let y = 2; y < S - 2; y++) {
+              for (let x = 2; x < S - 2; x++) {
+                const d = Math.abs(rd(x, y)[0] - level);
+                maxDev = Math.max(maxDev, d);
+                if (d > 0) varied++;
+              }
+            }
+            return { maxDev, varied };
+          }
+
+          // strength=0 必须恒等
+          const off = await grainRun(128, 0.0);
+          if (off.maxDev === 0) {
+            ok(`grain strength=0 恒等`);
+          } else {
+            fail(`grain strength=0 仍改变画面: 偏差 ${off.maxDev}`);
+          }
+
+          // 中间调应当有颗粒
+          const mid = await grainRun(110, 1.0);
+          if (mid.varied > 0) {
+            ok(`grain 中间调有颗粒 (${mid.varied} 像素变化, 最大 ±${mid.maxDev})`);
+          } else {
+            fail(`grain 中间调未生效`);
+          }
+
+          // 幅度必须温和 —— 基础 3/255 加权后不应超过约 5 个量化级
+          if (mid.maxDev <= 6) {
+            ok(`grain 幅度温和 (最大 ±${mid.maxDev} ≤ 6)`);
+          } else {
+            fail(`grain 幅度过大: ±${mid.maxDev}，会显噪点`);
+          }
+
+          // 纯黑不加（shadowGuard）
+          const black = await grainRun(2, 1.0);
+          if (black.maxDev <= 1) {
+            ok(`grain 纯黑区不加颗粒 (偏差 ${black.maxDev})`);
+          } else {
+            fail(`grain 污染纯黑区: 偏差 ${black.maxDev}，会显脏`);
+          }
+
+          // 高光不加（highlightGuard）
+          const white = await grainRun(252, 1.0);
+          if (white.maxDev <= 1) {
+            ok(`grain 高光区不加颗粒 (偏差 ${white.maxDev})`);
+          } else {
+            fail(`grain 污染高光区: 偏差 ${white.maxDev}`);
           }
         }
 

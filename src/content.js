@@ -1,21 +1,27 @@
 /* VidSharp — WebGPU 视频增强
  *
- * 三 pass 管线（顺序有讲究）：
+ * 管线（顺序有讲究，pass 数随设置变化）：
  *
  *   <video> --importExternalTexture-->
  *     [1] enhance  去块 + 去色带 + 局部对比度   (源分辨率)
  *     [2] easu     方向自适应放大               (→ 目标分辨率)
- *     [3] rcas     自适应锐化                   (目标分辨率)
+ *     [3] rcas     自适应锐化
+ *     [4] grain    合成胶片颗粒（可选）
+ *     [5] badge    状态角标合成（可选）
  *   --> <canvas>
  *
  * 为什么是这个顺序：
  *   - 去块必须在放大前：否则 EASU 会把块边界当真实边缘"保护"，块效应被锐化。
  *   - 锐化必须在放大后：放大前锐化会被插值重新糊掉。
+ *   - 颗粒必须在锐化后：否则 RCAS 会把颗粒当细节放大，变成噪点。
+ *   - 角标始终最后：避免被后续 pass 处理。
  *
  * 关键约束（改代码前先读）：
  *   - external texture 单帧有效：每帧重新 import，bind group 也必须重建。
  *   - 覆盖层不能压过弹幕/控制条：插到 video 的直接后继位置，继承 video 的
  *     层级，而不是把 z-index 顶到最大（那样会盖住播放器 UI）。
+ *   - 可选 pass 用 sharpened/pong 两张纹理乒乓串联 —— 同一张纹理不能在一个
+ *     pass 里既读又写；最后一个 pass 直接写 canvas 以省一次全屏绘制。
  *   - DRM 视频取不到像素，靠 consecutiveFailures 检测后自动退出。
  */
 
@@ -23,6 +29,7 @@ const SHADERS = {
   enhance: chrome.runtime.getURL("src/enhance.wgsl"),
   easu: chrome.runtime.getURL("src/easu.wgsl"),
   rcas: chrome.runtime.getURL("src/rcas.wgsl"),
+  grain: chrome.runtime.getURL("src/grain.wgsl"),
   badge: chrome.runtime.getURL("src/badge.wgsl"),
 };
 
@@ -33,6 +40,8 @@ const DEFAULTS = {
   deblock: 40,       // 去块 0~100
   deband: 30,        // 去色带 0~100
   contrast: 25,      // 局部对比度 0~100
+  grain: 0,          // 胶片颗粒 0~100（默认关，需按片源调）
+  grainSize: 1.0,    // 颗粒粗细 1~3
   upscale: "2k",     // off | 2k | 4k | 2x
   compare: false,    // 拖动对比模式
   badge: "corner",   // off | corner | detail — 增强状态标识
@@ -129,7 +138,7 @@ class Session {
     this.sampler = null;
     this.enhanceUniform = null;
     this.rcasUniform = null;
-    this.intermediates = { enhanced: null, upscaled: null, sharpened: null };
+    this.intermediates = { enhanced: null, upscaled: null, sharpened: null, pong: null };
     this.rvfcHandle = null;
     this.running = false;
     this.consecutiveFailures = 0;
@@ -142,6 +151,7 @@ class Session {
     this.badgeText = null;
     this.badgeSize = null;
     this.badgeUniform = null;
+    this.grainUniform = null;
     this.firstFrameDone = false;
     this.renderFrame = this.renderFrame.bind(this);
     this.syncSizes = this.syncSizes.bind(this);
@@ -179,6 +189,10 @@ class Session {
     );
     // 角标合成 pass 直接输出到 canvas，故用 canvas 格式；
     // 它的输入是 RCAS 已锐化的画面，也用同一格式以避免多余转换。
+    // grain 与 badge 都在 canvas 格式上工作（管线末端）
+    this.pipelines.grain = this.buildPipeline(
+      shaders.grain, "grain", this.format, false,
+    );
     this.pipelines.badge = this.buildPipeline(
       shaders.badge, "badge", this.format, false,
     );
@@ -195,6 +209,11 @@ class Session {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.rcasUniform = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    // strength, size, frameSeed, chroma
+    this.grainUniform = device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -275,6 +294,7 @@ class Session {
     this.intermediates.enhanced?.destroy();
     this.intermediates.upscaled?.destroy();
     this.intermediates.sharpened?.destroy();
+    this.intermediates.pong?.destroy();
 
     const usage =
       GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
@@ -298,6 +318,15 @@ class Session {
     // （即 canvas 格式），否则 render pass 校验失败。
     this.intermediates.sharpened = device.createTexture({
       label: "sharpened",
+      size: [this.outSize.w, this.outSize.h],
+      format: this.format,
+      usage,
+    });
+
+    // 乒乓用的第二张。多个可选 pass（grain/badge）串联时需要交替读写 ——
+    // 同一张纹理不能在一个 pass 里既作输入又作输出。
+    this.intermediates.pong = device.createTexture({
+      label: "pong",
       size: [this.outSize.w, this.outSize.h],
       format: this.format,
       usage,
@@ -524,6 +553,14 @@ class Session {
       0,
       0,
     ]));
+
+    this.device.queue.writeBuffer(this.grainUniform, 0, new Float32Array([
+      pct(settings.grain),
+      Math.max(1, Math.min(3, settings.grainSize)),
+      // 颗粒图案必须每帧变化，否则固定噪点会被看成屏幕脏污
+      this.frameCount % 4096,
+      0.15,   // 色度颗粒比例：真实胶片彩色颗粒较弱
+    ]));
   }
 
   /* ---- 渲染 ---- */
@@ -563,8 +600,9 @@ class Session {
       }
 
       this.frameCount++;
-      // 去色带抖动需要每帧变化，否则固定噪点图案会被眼睛识别为脏点
-      if (settings.deband > 0) this.updateUniforms();
+      // 去色带与颗粒都依赖帧号做时域去相关，图案必须每帧变化，
+      // 否则固定噪点会被眼睛识别为屏幕脏污
+      if (settings.deband > 0 || settings.grain > 0) this.updateUniforms();
 
       const external = this.device.importExternalTexture({
         source: this.video,
@@ -585,27 +623,54 @@ class Session {
         { binding: 1, resource: this.sampler },
       ], this.intermediates.upscaled.createView());
 
-      // Pass 3: RCAS 锐化。有角标时先渲到中间纹理，留给 Pass 4 合成；
-      // 无角标时直接出到 canvas，省一次全屏绘制。
+      /* 后续 pass 数量随设置变化（grain/角标可开可关），用乒乓纹理串联，
+       * 并让最后一个 pass 直接写 canvas 以省一次全屏绘制。
+       * sharpened/pong 两张纹理交替作为读写目标 —— 同一张纹理不能同时
+       * 既读又写。 */
+      const withGrain = settings.grain > 0;
       const withBadge = !!this.badgeTexture;
-      const rcasTarget = withBadge
-        ? this.intermediates.sharpened.createView()
-        : this.ctx.getCurrentTexture().createView();
+      const canvasView = this.ctx.getCurrentTexture().createView();
+      const pool = [this.intermediates.sharpened, this.intermediates.pong];
+      let poolIdx = 0;
+      // 剩余 pass 数：RCAS 恒有，grain/badge 可选
+      let remaining = 1 + (withGrain ? 1 : 0) + (withBadge ? 1 : 0);
+      const nextTarget = () => {
+        remaining--;
+        if (remaining === 0) return { view: canvasView, tex: null };
+        const tex = pool[poolIdx % 2];
+        poolIdx++;
+        return { view: tex.createView(), tex };
+      };
 
+      // Pass 3: RCAS 锐化
+      let cur = nextTarget();
       this.drawPass(encoder, this.pipelines.rcas, [
         { binding: 0, resource: this.intermediates.upscaled.createView() },
         { binding: 1, resource: this.sampler },
         { binding: 2, resource: { buffer: this.rcasUniform } },
-      ], rcasTarget);
+      ], cur.view);
+      let prev = cur.tex;
 
-      // Pass 4: 角标合成 → canvas
+      // Pass 4: 胶片颗粒 —— 放在锐化之后，否则 RCAS 会把颗粒当细节放大
+      if (withGrain) {
+        cur = nextTarget();
+        this.drawPass(encoder, this.pipelines.grain, [
+          { binding: 0, resource: prev.createView() },
+          { binding: 1, resource: this.sampler },
+          { binding: 2, resource: { buffer: this.grainUniform } },
+        ], cur.view);
+        prev = cur.tex;
+      }
+
+      // Pass 5: 角标合成（始终最后，避免被后续 pass 处理）
       if (withBadge) {
+        cur = nextTarget();
         this.drawPass(encoder, this.pipelines.badge, [
-          { binding: 0, resource: this.intermediates.sharpened.createView() },
+          { binding: 0, resource: prev.createView() },
           { binding: 1, resource: this.sampler },
           { binding: 2, resource: this.badgeTexture.createView() },
           { binding: 3, resource: { buffer: this.badgeUniform } },
-        ], this.ctx.getCurrentTexture().createView());
+        ], cur.view);
       }
 
       this.device.queue.submit([encoder.finish()]);
@@ -645,13 +710,16 @@ class Session {
     this.intermediates.enhanced?.destroy();
     this.intermediates.upscaled?.destroy();
     this.intermediates.sharpened?.destroy();
-    this.intermediates = { enhanced: null, upscaled: null, sharpened: null };
+    this.intermediates.pong?.destroy();
+    this.intermediates = { enhanced: null, upscaled: null, sharpened: null, pong: null };
     this.enhanceUniform?.destroy?.();
     this.rcasUniform?.destroy?.();
     this.badgeUniform?.destroy?.();
+    this.grainUniform?.destroy?.();
     this.enhanceUniform = null;
     this.rcasUniform = null;
     this.badgeUniform = null;
+    this.grainUniform = null;
     if (this.patchedParent) {
       this.patchedParent.style.position = "";
       this.patchedParent = null;

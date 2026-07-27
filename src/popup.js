@@ -5,12 +5,14 @@ const DEFAULTS = {
   deblock: 40,
   deband: 30,
   contrast: 25,
+  grain: 0,
+  grainSize: 1,
   upscale: "2k",
   compare: false,
   badge: "corner",
 };
 
-const SLIDERS = ["strength", "deblock", "deband", "contrast"];
+const SLIDERS = ["strength", "deblock", "deband", "contrast", "grain", "grainSize"];
 const CHECKBOXES = ["enabled", "denoise", "compare"];
 const SELECTS = ["upscale", "badge"];
 

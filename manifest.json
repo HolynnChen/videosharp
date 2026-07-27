@@ -25,6 +25,7 @@
         "src/enhance.wgsl",
         "src/easu.wgsl",
         "src/rcas.wgsl",
+        "src/grain.wgsl",
         "src/badge.wgsl"
       ],
       "matches": ["<all_urls>"]

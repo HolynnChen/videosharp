@@ -90,6 +90,16 @@
           // 否则反复创建 session 会撑爆 WASM 堆
           heavy: true,
         },
+        {
+          // 关键对照：输入空间维已放宽为动态，可一次前向处理整帧。
+          // 若"分块调度开销是主因"的判断成立，它应当远快于上面两个。
+          name: "XLSR (动态 shape, 全帧)",
+          file: "../models/xlsr-dynamic.onnx",
+          ch: 3, scale: 4,
+          fullFrame: true,
+          // 4x 模型：输入取 1080p 的 1/4 边长，输出恰为 1080p
+          inputW: 480, inputH: 270,
+        },
       ];
 
       const BUDGET_60 = 1000 / 60;
@@ -171,12 +181,21 @@
 
       function makeFeed(o, session, model, batch) {
         const feeds = {};
+        // 全帧模型用指定的输入尺寸；分块模型用方形 tile
+        const w = model.fullFrame ? model.inputW : model.tile;
+        const h = model.fullFrame ? model.inputH : model.tile;
         feeds[session.inputNames[0]] = new o.Tensor(
           "float32",
-          new Float32Array(batch * model.ch * model.tile * model.tile).fill(0.5),
-          [batch, model.ch, model.tile, model.tile],
+          new Float32Array(batch * model.ch * h * w).fill(0.5),
+          [batch, model.ch, h, w],
         );
         return feeds;
+      }
+
+      /** 处理 1080p 所需的前向次数。全帧模型为 1。 */
+      function tilesFor(model) {
+        if (model.fullFrame) return 1;
+        return Math.ceil(1920 / model.tile) * Math.ceil(1080 / model.tile);
       }
 
       /* session.release() 返回 Promise —— 不 await 的话 WASM 堆还没回收就
@@ -236,11 +255,23 @@
         log(`  warmup: ${(performance.now() - tw).toFixed(0)}ms`);
 
         const { median, best } = await timeRuns(session, feeds, 10);
-        const tiles = Math.ceil(1920 / model.tile) * Math.ceil(1080 / model.tile);
+        const tiles = tilesFor(model);
         const frameMs = median * tiles;
-        log(`  单块: 中位 ${median.toFixed(2)}ms / 最快 ${best.toFixed(2)}ms  [${model.tile}²]`);
-        log(`  1080p: ${tiles} 块 × ${median.toFixed(2)}ms = ${frameMs.toFixed(0)}ms → ${(1000/frameMs).toFixed(1)} fps`);
-        log(`  距 60fps: 需再快 ${(frameMs / BUDGET_60).toFixed(0)}×`);
+        if (model.fullFrame) {
+          log(`  全帧一次前向: 中位 ${median.toFixed(2)}ms / 最快 ${best.toFixed(2)}ms` +
+              `  [${model.inputW}×${model.inputH} → ${model.inputW*model.scale}×${model.inputH*model.scale}]`);
+          log(`  1080p 单帧: ${frameMs.toFixed(2)}ms → ${(1000/frameMs).toFixed(1)} fps`);
+        } else {
+          log(`  单块: 中位 ${median.toFixed(2)}ms / 最快 ${best.toFixed(2)}ms  [${model.tile}²]`);
+          log(`  1080p: ${tiles} 块 × ${median.toFixed(2)}ms = ${frameMs.toFixed(0)}ms → ${(1000/frameMs).toFixed(1)} fps`);
+        }
+        if (frameMs <= BUDGET_60) {
+          log(`  ✓ 满足 60fps（预算 ${BUDGET_60.toFixed(1)}ms，余 ${(BUDGET_60-frameMs).toFixed(1)}ms）`);
+        } else if (frameMs <= BUDGET_30) {
+          log(`  ~ 满足 30fps，不足 60fps`);
+        } else {
+          log(`  距 60fps: 需再快 ${(frameMs / BUDGET_60).toFixed(0)}×`);
+        }
 
         await dispose(session);
         return { model, ep, median, tiles, frameMs };
@@ -304,8 +335,14 @@
           return null;
         }
 
-        const tiles = Math.ceil(1920 / model.tile) * Math.ceil(1080 / model.tile);
+        const tiles = tilesFor(model);
         const results = [];
+        // 全帧模型本就一次前向，批处理无意义
+        if (model.fullFrame) {
+          log(`  跳过 —— 全帧模型一次前向即完成，无需批处理。`);
+          await dispose(session);
+          return null;
+        }
         // 重型模型只测到 batch=4：batch=16 × 250ms 会分配巨大的中间张量，
         // 实测会把 WASM 堆撑爆（memory access out of bounds）
         const batches = model.heavy ? [1, 2, 4] : [1, 4, 8, 16];
@@ -359,6 +396,10 @@
       async function diagConcurrent(model) {
         const o = await loadOrt();
         log(`\n── 并行提交诊断: ${model.name} ──`);
+        if (model.fullFrame) {
+          log(`  跳过 —— 全帧模型每帧只有一次前向，无并发可言。`);
+          return null;
+        }
 
         // 单次耗时用来推算超时上限，避免再次卡死整个页面
         let unitMs = 0;

@@ -11,14 +11,31 @@ const MODELS = [
   {
     name: "espcn.onnx",
     url: "https://github.com/onnx/models/raw/main/validated/vision/super_resolution/sub_pixel_cnn_2016/model/super-resolution-10.onnx",
-    desc: "ESPCN / sub-pixel CNN (仅亮度通道, 224² 输入)",
+    desc: "ESPCN / sub-pixel CNN (仅亮度, 固定 224² 输入)",
   },
   {
     name: "realesr-general.onnx",
     url: "https://huggingface.co/tamnvcc/Real-ESRGAN-General-x4v3_float/resolve/main/onnx/model.onnx",
-    desc: "realesr-general-x4v3 (RGB 通用, 128² 输入)",
+    desc: "realesr-general-x4v3 (RGB 通用, 固定 128² 输入)",
   },
 ];
+
+/* xlsr-dynamic.onnx 不在此下载：它是把高通 XLSR 的输入空间维从固定 128
+ * 放宽为动态后的产物（244KB，已随仓库提交）。
+ *
+ * XLSR 原始权重来自：
+ *   https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/
+ *   models/xlsr/releases/v0.58.0/xlsr-onnx-float.zip
+ *
+ * 放宽方法（需 python + onnx 包）：
+ *   dims = model.graph.input[0].type.tensor_type.shape.dim
+ *   dims[2].dim_param = 'H'; dims[3].dim_param = 'W'   # 清掉 dim_value
+ *   del model.graph.value_info[:]                       # 清中间固定 shape
+ *
+ * 之所以可行：XLSR 是纯卷积（Conv/Relu/Clip/Concat/DepthToSpace，无
+ * Reshape），空间维本可任意，128 只是导出时的样例尺寸。放宽后能一次前向
+ * 处理整帧而不分块 —— 这是能否实时的分水岭。
+ */
 
 const DIR = path.resolve(__dirname, "..", "models");
 
