@@ -1,14 +1,19 @@
 {
   "name": "vidsharp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "WebGPU RCAS adaptive sharpening for web video",
+  "description": "WebGPU video enhancement: EASU upscaling + deblock/deband + RCAS sharpening",
   "scripts": {
-    "test": "node test/run.js"
+    "test": "node test/run.js",
+    "fetch-models": "node test/fetch-models.js",
+    "probe": "node test/serve-probe.js"
   },
   "license": "MIT",
   "type": "commonjs",
   "devDependencies": {
     "playwright-core": "^1.62.0"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.27.0"
   }
 }

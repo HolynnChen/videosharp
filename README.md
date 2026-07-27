@@ -24,13 +24,30 @@
 
 ## 为什么不用神经网络超分
 
-调研结论：**2026 年在浏览器里用神经网络做 1080p 真人实时超分不成立**。
+调研 + **实测**结论：**2026 年在浏览器里用神经网络做 1080p 真人实时超分不成立**。
 
-- Edge 内置 VSR 用原生 DirectML，RTX 2060 上 360p 就需约 20ms/帧，
-  且把触发条件限死在 720p 以下
-- 浏览器 WebGPU 只会更紧
-- NVIDIA / Intel / 微软都因此把方案放在驱动层，且都不开放第三方 API
-- 现有浏览器扩展基本都以 Anime4K 为核心，对真人内容效果有限
+仓库内附带了一个可复现的探针（见下方「CNN 可行性探针」），实测数据：
+
+| 模型 | 单块推理 (CPU/WASM 单线程) | 1080p 分块数 | 单帧总耗时 |
+|---|---|---|---|
+| ESPCN | 417 ms @224² | 45 | **18.8 秒** |
+| realesr-general-x4v3 | 2555 ms @128² | 135 | **345 秒** |
+
+实时预算是 **16.7ms/帧**。即便 WebGPU 相对单线程 WASM 有 10~50× 加速，
+ESPCN 仍差一个数量级；而 **45 次串行推理的 GPU 调度开销本身**在 16ms 内
+就已十分勉强，135 次更不可能。
+
+根本原因是两个公开权重的**输入尺寸都是硬编码的**（ESPCN `[1,1,224,224]`、
+realesr `[1,3,128,128]`），并非全卷积动态 shape，因此 1080p 必须分块，
+还要额外承担块间重叠与融合的成本。
+
+旁证：Edge 内置 VSR 用的是**原生 DirectML**（比 WebGPU 更快的路径），
+RTX 2060 上 360p 仍需约 20ms/帧，且把触发条件限死在 720p 以下。微软用
+更优的技术栈、专门训练的 0.1MB 模型，也只做到那个程度。
+
+要真正实现浏览器 CNN 超分，需要的是**为此专门设计的模型**：全卷积、
+单次前向、参数量 1~10 万级、且在 WebGPU 算子约束下做过针对性设计。
+那是研究工作，不是集成工作。
 
 EASU + RCAS 走的是另一条路：**不生成细节，但把已有细节重建和强化到位**。
 代价是达不到 GAN 的纹理质感，收益是零依赖、全硬件覆盖、不假造纹理。
@@ -90,6 +107,40 @@ const c = document.querySelector('.vidsharp-overlay');
 console.log(c.width + 'x' + c.height);
 ```
 
+## CNN 可行性探针
+
+上面的「不用神经网络」结论是在无 GPU 的 CI 环境用 CPU/WASM 测出来的。
+如果你想在**自己的真实 GPU** 上验证（比如 Apple M1、RTX 独显），可以直接跑：
+
+```bash
+npm install
+npm run fetch-models   # 下载两个 ONNX 模型（约 5MB，不入 Git）
+npm run probe
+```
+
+然后在 Chrome / Edge 中打开 `http://localhost:8777/`，点「开始测试」。
+
+页面会显示本机 GPU 信息，并测量两个模型在 **WebGPU EP** 上的：
+
+- 模型加载耗时
+- warmup 耗时（含 shader 编译）
+- 单块推理中位/最快耗时
+- 1080p 所需分块数与单帧总耗时
+- 距 60fps 预算还差多少倍
+
+最后给出「可行 / 勉强可行 / 不可行」的判定。也可点第二个按钮同时对比
+WASM EP，看 WebGPU 实际带来多少倍加速。
+
+**注意**：模型与 `onnxruntime-web` 依赖**仅供此探针使用**，扩展本体完全不需要
+它们 —— 装扩展不必 `npm install`。`models/` 已在 `.gitignore` 中，不占仓库体积。
+
+探针踩过的两个坑（已在代码中处理，供参考）：
+
+- `ort.env.wasm.wasmPaths` **必须是绝对 URL**。给相对路径会被拼到模块自身
+  目录下，变成 `.../onnxruntime-web/node_modules/onnxruntime-web/dist/...`。
+- `ort.env.wasm.numThreads = 1`。多线程依赖 blob worker，在扩展/严格 CSP
+  环境下会踩 `URL.createObjectURL is not a function`。
+
 ## 已知限制
 
 - **DRM 视频无法处理**（Netflix、Disney+ 等）。受 EME 保护的解码帧在受保护
@@ -138,14 +189,17 @@ src/
 test/
   shaders.test.html    shader 单元测试
   run.js               测试驱动
+  cnn-probe.html       CNN 可行性探针（浏览器内，测真实 GPU）
+  serve-probe.js       探针用本地服务器
+  fetch-models.js      探针用模型下载脚本
 ```
 
 ## 后续可加
 
-- 轻量 CNN 作为可选高质量档（ESPCN / eSR / SPAN-tiny，参数量对齐
-  Edge VSR 的 0.1~1MB 标尺）
-- 按站点白名单与独立参数预设
+- 按站点白名单与独立参数预设（动画/真人不同档）
 - 内置 GPU 基准测试，自动推荐参数档位
+- 更多画质修复手段（振铃抑制、色度上采样改进）
+- 若将来出现全卷积、参数量 1~10 万级的通用轻量 SR 模型，可重新评估 CNN 档
 
 ## 许可
 

@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>VidSharp — CNN 超分可行性探针</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 32px 20px 64px;
+        font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      .sub { opacity: 0.6; margin: 0 0 24px; font-size: 13px; }
+      button {
+        font: inherit;
+        padding: 8px 18px;
+        border-radius: 6px;
+        border: 1px solid rgba(128,128,128,0.4);
+        background: rgba(128,128,128,0.08);
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .env {
+        margin: 18px 0;
+        padding: 12px 14px;
+        border-radius: 8px;
+        background: rgba(128,128,128,0.1);
+        font-size: 13px;
+      }
+      .env div { margin: 2px 0; }
+      pre {
+        margin: 18px 0 0;
+        padding: 14px;
+        border-radius: 8px;
+        background: rgba(128,128,128,0.1);
+        font-size: 12.5px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .verdict {
+        margin: 20px 0 0;
+        padding: 14px 16px;
+        border-radius: 8px;
+        font-weight: 600;
+      }
+      .verdict.bad { background: rgba(220,60,60,0.14); color: #d33; }
+      .verdict.ok  { background: rgba(40,170,90,0.14); color: #1a8; }
+      .verdict.warn { background: rgba(230,160,30,0.16); color: #b80; }
+      table { border-collapse: collapse; width: 100%; margin: 18px 0 0; font-size: 13px; }
+      th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid rgba(128,128,128,0.25); }
+      th { font-weight: 600; opacity: 0.7; }
+      td.num { text-align: right; font-variant-numeric: tabular-nums; }
+      .note { margin-top: 22px; font-size: 12px; opacity: 0.65; }
+    </style>
+  </head>
+  <body>
+    <h1>CNN 超分可行性探针</h1>
+    <p class="sub">
+      测量轻量超分模型在本机 WebGPU 上的真实推理耗时，判断能否用于实时视频。
+    </p>
+
+    <div class="env" id="env">检测环境…</div>
+
+    <button id="run">开始测试</button>
+    <button id="runWasm">同时测 WASM (慢，可选)</button>
+
+    <div id="verdict"></div>
+    <div id="table"></div>
+    <pre id="log">等待开始…</pre>
+
+    <p class="note">
+      实时视频的预算是 <strong>16.7ms/帧</strong>（60fps）或 <strong>33ms/帧</strong>（30fps）。<br />
+      两个模型的输入尺寸都是硬编码的，因此 1080p 必须分块推理，每块一次前向。
+      实际还需加上块间重叠与融合的开销，此处未计入 —— 真实耗时会比这里更高。
+    </p>
+
+    <script type="module">
+      const MODELS = [
+        {
+          name: "ESPCN (sub-pixel CNN)",
+          file: "../models/espcn.onnx",
+          tile: 224, ch: 1, scale: 3,
+          note: "仅亮度通道，色度走 bicubic",
+        },
+        {
+          name: "realesr-general-x4v3",
+          file: "../models/realesr-general.onnx",
+          tile: 128, ch: 3, scale: 4,
+          note: "真人+动画通用，RGB 三通道",
+        },
+      ];
+
+      const BUDGET_60 = 1000 / 60;
+      const BUDGET_30 = 1000 / 30;
+
+      const logEl = document.getElementById("log");
+      const lines = [];
+      const log = (m = "") => {
+        lines.push(m);
+        logEl.textContent = lines.join("\n");
+      };
+
+      /* ---- 环境检测 ---- */
+      const envEl = document.getElementById("env");
+      let adapterInfo = null;
+      async function detectEnv() {
+        const rows = [];
+        rows.push(`浏览器: ${navigator.userAgent.match(/(Chrome|Edg|Safari|Firefox)\/[\d.]+/)?.[0] || "未知"}`);
+        rows.push(`平台: ${navigator.platform}`);
+        if (!navigator.gpu) {
+          rows.push(`WebGPU: <strong style="color:#d33">不可用</strong>`);
+        } else {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (!adapter) {
+            rows.push(`WebGPU: <strong style="color:#d33">无法获取 adapter</strong>`);
+          } else {
+            adapterInfo = adapter.info || {};
+            const bits = [adapterInfo.vendor, adapterInfo.architecture, adapterInfo.description]
+              .filter(Boolean).join(" / ") || "(信息受限)";
+            rows.push(`WebGPU: 可用 — ${bits}`);
+            rows.push(`最大纹理尺寸: ${adapter.limits.maxTextureDimension2D}`);
+          }
+        }
+        envEl.innerHTML = rows.map((r) => `<div>${r}</div>`).join("");
+      }
+      await detectEnv();
+
+      /* ---- 测试 ---- */
+      let ort = null;
+      async function loadOrt() {
+        if (ort) return ort;
+        ort = await import("../node_modules/onnxruntime-web/dist/ort.webgpu.min.mjs");
+        // 相对路径会被拼到模块自身目录下变成错误路径，必须给绝对 URL
+        ort.env.wasm.wasmPaths =
+          new URL("../node_modules/onnxruntime-web/dist/", location.href).href;
+        // MV3/严格 CSP 下多线程依赖 blob worker，单线程更稳
+        ort.env.wasm.numThreads = 1;
+        ort.env.logLevel = "warning";
+        return ort;
+      }
+
+      async function benchmark(model, ep) {
+        const o = await loadOrt();
+        const label = `${model.name} [${ep}]`;
+        log(`\n── ${label} ──`);
+
+        let session;
+        const tLoad = performance.now();
+        try {
+          session = await o.InferenceSession.create(model.file, {
+            executionProviders: [ep],
+            graphOptimizationLevel: "all",
+          });
+        } catch (err) {
+          log(`  ✗ 加载失败: ${err.message}`);
+          return { model, ep, error: err.message };
+        }
+        const loadMs = performance.now() - tLoad;
+        log(`  加载: ${loadMs.toFixed(0)}ms`);
+
+        const feeds = {};
+        feeds[session.inputNames[0]] = new o.Tensor(
+          "float32",
+          new Float32Array(model.tile * model.tile * model.ch).fill(0.5),
+          [1, model.ch, model.tile, model.tile],
+        );
+
+        // 首次运行含 shader 编译/pipeline 创建，单独计时不计入
+        const tWarm = performance.now();
+        try {
+          await session.run(feeds);
+        } catch (err) {
+          log(`  ✗ 推理失败: ${err.message}`);
+          session.release?.();
+          return { model, ep, error: err.message, loadMs };
+        }
+        const warmMs = performance.now() - tWarm;
+        log(`  warmup: ${warmMs.toFixed(0)}ms (含 shader 编译)`);
+
+        const N = 10;
+        const times = [];
+        for (let i = 0; i < N; i++) {
+          const t = performance.now();
+          await session.run(feeds);
+          times.push(performance.now() - t);
+          // 让出主线程，避免长任务卡死页面
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        session.release?.();
+
+        times.sort((a, b) => a - b);
+        const median = times[Math.floor(N / 2)];
+        const best = times[0];
+
+        const tilesX = Math.ceil(1920 / model.tile);
+        const tilesY = Math.ceil(1080 / model.tile);
+        const tiles = tilesX * tilesY;
+        const frameMs = median * tiles;
+
+        log(`  单块推理: 中位 ${median.toFixed(2)}ms / 最快 ${best.toFixed(2)}ms  [${model.tile}²]`);
+        log(`  1080p 分块: ${tilesX}×${tilesY} = ${tiles} 块`);
+        log(`  1080p 单帧: ${frameMs.toFixed(0)}ms → ${(1000 / frameMs).toFixed(1)} fps`);
+        log(`  距 60fps 预算: 需再快 ${(frameMs / BUDGET_60).toFixed(0)}×`);
+
+        return { model, ep, loadMs, warmMs, median, best, tiles, frameMs };
+      }
+
+      function renderResults(results) {
+        const rows = results.map((r) => {
+          if (r.error) {
+            return `<tr><td>${r.model.name}</td><td>${r.ep}</td>
+              <td colspan="4" style="color:#d33">${r.error}</td></tr>`;
+          }
+          const fps = 1000 / r.frameMs;
+          return `<tr>
+            <td>${r.model.name}</td>
+            <td>${r.ep}</td>
+            <td class="num">${r.median.toFixed(2)} ms</td>
+            <td class="num">${r.tiles}</td>
+            <td class="num">${r.frameMs.toFixed(0)} ms</td>
+            <td class="num">${fps.toFixed(1)}</td>
+          </tr>`;
+        }).join("");
+
+        document.getElementById("table").innerHTML = `
+          <table>
+            <thead><tr>
+              <th>模型</th><th>EP</th><th>单块</th>
+              <th>1080p 块数</th><th>单帧</th><th>fps</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+
+        // 判定：以最快的成功结果为准
+        const good = results.filter((r) => !r.error);
+        const vEl = document.getElementById("verdict");
+        if (!good.length) {
+          vEl.className = "verdict bad";
+          vEl.textContent = "全部模型加载或推理失败，无法评估。";
+          return;
+        }
+        const bestR = good.reduce((a, b) => (a.frameMs < b.frameMs ? a : b));
+        const fps = 1000 / bestR.frameMs;
+        if (bestR.frameMs <= BUDGET_60) {
+          vEl.className = "verdict ok";
+          vEl.textContent =
+            `可行：最优组合 ${bestR.model.name} 达 ${fps.toFixed(1)} fps，满足 60fps 实时。`;
+        } else if (bestR.frameMs <= BUDGET_30) {
+          vEl.className = "verdict warn";
+          vEl.textContent =
+            `勉强可行：最优 ${fps.toFixed(1)} fps，够 30fps 但无余量（未计分块融合开销）。`;
+        } else {
+          vEl.className = "verdict bad";
+          vEl.textContent =
+            `不可行：最优仅 ${fps.toFixed(1)} fps，距 60fps 还需快 ` +
+            `${(bestR.frameMs / BUDGET_60).toFixed(0)} 倍。EASU 纯 shader 方案更合适。`;
+        }
+      }
+
+      async function runAll(eps) {
+        const btns = [document.getElementById("run"), document.getElementById("runWasm")];
+        btns.forEach((b) => (b.disabled = true));
+        lines.length = 0;
+        log(`开始测试 — ${new Date().toLocaleTimeString()}`);
+
+        // 模型不入 Git，缺失时给出可操作的提示而非 fetch 报错
+        const missing = [];
+        for (const m of MODELS) {
+          const r = await fetch(m.file, { method: "HEAD" }).catch(() => null);
+          if (!r || !r.ok) missing.push(m.file.replace("../", ""));
+        }
+        if (missing.length) {
+          log(`\n✗ 缺少模型文件:\n    ${missing.join("\n    ")}`);
+          log(`\n  请先运行:  npm run fetch-models`);
+          const vEl = document.getElementById("verdict");
+          vEl.className = "verdict warn";
+          vEl.textContent = "缺少模型文件，请先运行 npm run fetch-models";
+          btns.forEach((b) => (b.disabled = false));
+          return;
+        }
+
+        if (adapterInfo) {
+          log(`GPU: ${[adapterInfo.vendor, adapterInfo.architecture].filter(Boolean).join(" ") || "(受限)"}`);
+        }
+
+        const results = [];
+        for (const ep of eps) {
+          for (const model of MODELS) {
+            results.push(await benchmark(model, ep));
+            renderResults(results);
+          }
+        }
+        log(`\n完成。`);
+        btns.forEach((b) => (b.disabled = false));
+      }
+
+      document.getElementById("run").addEventListener("click", () => runAll(["webgpu"]));
+      document.getElementById("runWasm").addEventListener("click", () =>
+        runAll(["webgpu", "wasm"]));
+    </script>
+  </body>
+</html>
