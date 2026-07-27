@@ -6,7 +6,7 @@
     <style>
       :root { color-scheme: light dark; }
       body {
-        max-width: 760px;
+        max-width: 820px;
         margin: 0 auto;
         padding: 32px 20px 64px;
         font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -16,6 +16,7 @@
       button {
         font: inherit;
         padding: 8px 18px;
+        margin: 0 6px 8px 0;
         border-radius: 6px;
         border: 1px solid rgba(128,128,128,0.4);
         background: rgba(128,128,128,0.08);
@@ -49,47 +50,41 @@
       .verdict.bad { background: rgba(220,60,60,0.14); color: #d33; }
       .verdict.ok  { background: rgba(40,170,90,0.14); color: #1a8; }
       .verdict.warn { background: rgba(230,160,30,0.16); color: #b80; }
-      table { border-collapse: collapse; width: 100%; margin: 18px 0 0; font-size: 13px; }
-      th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid rgba(128,128,128,0.25); }
-      th { font-weight: 600; opacity: 0.7; }
-      td.num { text-align: right; font-variant-numeric: tabular-nums; }
       .note { margin-top: 22px; font-size: 12px; opacity: 0.65; }
     </style>
   </head>
   <body>
     <h1>CNN 超分可行性探针</h1>
     <p class="sub">
-      测量轻量超分模型在本机 WebGPU 上的真实推理耗时，判断能否用于实时视频。
+      测量轻量超分模型在本机 WebGPU 上的真实推理耗时，并诊断 GPU 是否被充分利用。
     </p>
 
     <div class="env" id="env">检测环境…</div>
 
-    <button id="run">开始测试</button>
-    <button id="runWasm">同时测 WASM (慢，可选)</button>
+    <button id="run">基础测试 (WebGPU)</button>
+    <button id="runFull">完整诊断 (含批处理/回退检测)</button>
+    <button id="runWasm">加测 WASM 对照</button>
 
     <div id="verdict"></div>
-    <div id="table"></div>
     <pre id="log">等待开始…</pre>
 
     <p class="note">
-      实时视频的预算是 <strong>16.7ms/帧</strong>（60fps）或 <strong>33ms/帧</strong>（30fps）。<br />
-      两个模型的输入尺寸都是硬编码的，因此 1080p 必须分块推理，每块一次前向。
-      实际还需加上块间重叠与融合的开销，此处未计入 —— 真实耗时会比这里更高。
+      实时视频预算：<strong>16.7ms/帧</strong>（60fps）或 <strong>33ms/帧</strong>（30fps）。<br />
+      两个模型的输入空间尺寸都是硬编码的，1080p 必须分块，每块一次前向。
+      此处未计入块间重叠与融合开销 —— 真实耗时会更高。
     </p>
 
     <script type="module">
       const MODELS = [
         {
-          name: "ESPCN (sub-pixel CNN)",
+          name: "ESPCN",
           file: "../models/espcn.onnx",
           tile: 224, ch: 1, scale: 3,
-          note: "仅亮度通道，色度走 bicubic",
         },
         {
           name: "realesr-general-x4v3",
           file: "../models/realesr-general.onnx",
           tile: 128, ch: 3, scale: 4,
-          note: "真人+动画通用，RGB 三通道",
         },
       ];
 
@@ -98,14 +93,16 @@
 
       const logEl = document.getElementById("log");
       const lines = [];
-      const log = (m = "") => {
-        lines.push(m);
-        logEl.textContent = lines.join("\n");
+      const log = (m = "") => { lines.push(m); logEl.textContent = lines.join("\n"); };
+      const setVerdict = (cls, text) => {
+        const el = document.getElementById("verdict");
+        el.className = "verdict " + cls;
+        el.textContent = text;
       };
 
-      /* ---- 环境检测 ---- */
-      const envEl = document.getElementById("env");
-      let adapterInfo = null;
+      /* ---- 环境 ---- */
+      let adapter = null;
+      let device = null;
       async function detectEnv() {
         const rows = [];
         rows.push(`浏览器: ${navigator.userAgent.match(/(Chrome|Edg|Safari|Firefox)\/[\d.]+/)?.[0] || "未知"}`);
@@ -113,193 +110,363 @@
         if (!navigator.gpu) {
           rows.push(`WebGPU: <strong style="color:#d33">不可用</strong>`);
         } else {
-          const adapter = await navigator.gpu.requestAdapter();
+          adapter = await navigator.gpu.requestAdapter();
           if (!adapter) {
             rows.push(`WebGPU: <strong style="color:#d33">无法获取 adapter</strong>`);
           } else {
-            adapterInfo = adapter.info || {};
-            const bits = [adapterInfo.vendor, adapterInfo.architecture, adapterInfo.description]
-              .filter(Boolean).join(" / ") || "(信息受限)";
-            rows.push(`WebGPU: 可用 — ${bits}`);
-            rows.push(`最大纹理尺寸: ${adapter.limits.maxTextureDimension2D}`);
+            const i = adapter.info || {};
+            rows.push(`GPU: ${[i.vendor, i.architecture, i.description].filter(Boolean).join(" / ") || "(信息受限)"}`);
+            rows.push(`最大纹理: ${adapter.limits.maxTextureDimension2D} · 最大计算工作组: ${adapter.limits.maxComputeWorkgroupSizeX}`);
           }
         }
-        envEl.innerHTML = rows.map((r) => `<div>${r}</div>`).join("");
+        document.getElementById("env").innerHTML =
+          rows.map((r) => `<div>${r}</div>`).join("");
       }
       await detectEnv();
 
-      /* ---- 测试 ---- */
+      /* ---- ORT ---- */
       let ort = null;
       async function loadOrt() {
         if (ort) return ort;
         ort = await import("../node_modules/onnxruntime-web/dist/ort.webgpu.min.mjs");
-        // 相对路径会被拼到模块自身目录下变成错误路径，必须给绝对 URL
+        // 相对路径会被拼到模块目录下变成错误路径，必须绝对 URL
         ort.env.wasm.wasmPaths =
           new URL("../node_modules/onnxruntime-web/dist/", location.href).href;
-        // MV3/严格 CSP 下多线程依赖 blob worker，单线程更稳
+        // 多线程依赖 blob worker，扩展/严格 CSP 下会失败
         ort.env.wasm.numThreads = 1;
         ort.env.logLevel = "warning";
         return ort;
       }
 
-      async function benchmark(model, ep) {
-        const o = await loadOrt();
-        const label = `${model.name} [${ep}]`;
-        log(`\n── ${label} ──`);
-
-        let session;
-        const tLoad = performance.now();
-        try {
-          session = await o.InferenceSession.create(model.file, {
-            executionProviders: [ep],
-            graphOptimizationLevel: "all",
-          });
-        } catch (err) {
-          log(`  ✗ 加载失败: ${err.message}`);
-          return { model, ep, error: err.message };
-        }
-        const loadMs = performance.now() - tLoad;
-        log(`  加载: ${loadMs.toFixed(0)}ms`);
-
-        const feeds = {};
-        feeds[session.inputNames[0]] = new o.Tensor(
-          "float32",
-          new Float32Array(model.tile * model.tile * model.ch).fill(0.5),
-          [1, model.ch, model.tile, model.tile],
-        );
-
-        // 首次运行含 shader 编译/pipeline 创建，单独计时不计入
-        const tWarm = performance.now();
-        try {
-          await session.run(feeds);
-        } catch (err) {
-          log(`  ✗ 推理失败: ${err.message}`);
-          session.release?.();
-          return { model, ep, error: err.message, loadMs };
-        }
-        const warmMs = performance.now() - tWarm;
-        log(`  warmup: ${warmMs.toFixed(0)}ms (含 shader 编译)`);
-
-        const N = 10;
-        const times = [];
-        for (let i = 0; i < N; i++) {
-          const t = performance.now();
-          await session.run(feeds);
-          times.push(performance.now() - t);
-          // 让出主线程，避免长任务卡死页面
-          await new Promise((r) => setTimeout(r, 0));
-        }
-        session.release?.();
-
-        times.sort((a, b) => a - b);
-        const median = times[Math.floor(N / 2)];
-        const best = times[0];
-
-        const tilesX = Math.ceil(1920 / model.tile);
-        const tilesY = Math.ceil(1080 / model.tile);
-        const tiles = tilesX * tilesY;
-        const frameMs = median * tiles;
-
-        log(`  单块推理: 中位 ${median.toFixed(2)}ms / 最快 ${best.toFixed(2)}ms  [${model.tile}²]`);
-        log(`  1080p 分块: ${tilesX}×${tilesY} = ${tiles} 块`);
-        log(`  1080p 单帧: ${frameMs.toFixed(0)}ms → ${(1000 / frameMs).toFixed(1)} fps`);
-        log(`  距 60fps 预算: 需再快 ${(frameMs / BUDGET_60).toFixed(0)}×`);
-
-        return { model, ep, loadMs, warmMs, median, best, tiles, frameMs };
-      }
-
-      function renderResults(results) {
-        const rows = results.map((r) => {
-          if (r.error) {
-            return `<tr><td>${r.model.name}</td><td>${r.ep}</td>
-              <td colspan="4" style="color:#d33">${r.error}</td></tr>`;
-          }
-          const fps = 1000 / r.frameMs;
-          return `<tr>
-            <td>${r.model.name}</td>
-            <td>${r.ep}</td>
-            <td class="num">${r.median.toFixed(2)} ms</td>
-            <td class="num">${r.tiles}</td>
-            <td class="num">${r.frameMs.toFixed(0)} ms</td>
-            <td class="num">${fps.toFixed(1)}</td>
-          </tr>`;
-        }).join("");
-
-        document.getElementById("table").innerHTML = `
-          <table>
-            <thead><tr>
-              <th>模型</th><th>EP</th><th>单块</th>
-              <th>1080p 块数</th><th>单帧</th><th>fps</th>
-            </tr></thead>
-            <tbody>${rows}</tbody>
-          </table>`;
-
-        // 判定：以最快的成功结果为准
-        const good = results.filter((r) => !r.error);
-        const vEl = document.getElementById("verdict");
-        if (!good.length) {
-          vEl.className = "verdict bad";
-          vEl.textContent = "全部模型加载或推理失败，无法评估。";
-          return;
-        }
-        const bestR = good.reduce((a, b) => (a.frameMs < b.frameMs ? a : b));
-        const fps = 1000 / bestR.frameMs;
-        if (bestR.frameMs <= BUDGET_60) {
-          vEl.className = "verdict ok";
-          vEl.textContent =
-            `可行：最优组合 ${bestR.model.name} 达 ${fps.toFixed(1)} fps，满足 60fps 实时。`;
-        } else if (bestR.frameMs <= BUDGET_30) {
-          vEl.className = "verdict warn";
-          vEl.textContent =
-            `勉强可行：最优 ${fps.toFixed(1)} fps，够 30fps 但无余量（未计分块融合开销）。`;
-        } else {
-          vEl.className = "verdict bad";
-          vEl.textContent =
-            `不可行：最优仅 ${fps.toFixed(1)} fps，距 60fps 还需快 ` +
-            `${(bestR.frameMs / BUDGET_60).toFixed(0)} 倍。EASU 纯 shader 方案更合适。`;
-        }
-      }
-
-      async function runAll(eps) {
-        const btns = [document.getElementById("run"), document.getElementById("runWasm")];
-        btns.forEach((b) => (b.disabled = true));
-        lines.length = 0;
-        log(`开始测试 — ${new Date().toLocaleTimeString()}`);
-
-        // 模型不入 Git，缺失时给出可操作的提示而非 fetch 报错
+      async function checkModels() {
         const missing = [];
         for (const m of MODELS) {
           const r = await fetch(m.file, { method: "HEAD" }).catch(() => null);
           if (!r || !r.ok) missing.push(m.file.replace("../", ""));
         }
         if (missing.length) {
-          log(`\n✗ 缺少模型文件:\n    ${missing.join("\n    ")}`);
+          log(`\n✗ 缺少模型:\n    ${missing.join("\n    ")}`);
           log(`\n  请先运行:  npm run fetch-models`);
-          const vEl = document.getElementById("verdict");
-          vEl.className = "verdict warn";
-          vEl.textContent = "缺少模型文件，请先运行 npm run fetch-models";
-          btns.forEach((b) => (b.disabled = false));
+          setVerdict("warn", "缺少模型文件，请先运行 npm run fetch-models");
+          return false;
+        }
+        return true;
+      }
+
+      function makeSession(o, file, ep) {
+        return o.InferenceSession.create(file, {
+          executionProviders: [ep],
+          graphOptimizationLevel: "all",
+        });
+      }
+
+      function makeFeed(o, session, model, batch) {
+        const feeds = {};
+        feeds[session.inputNames[0]] = new o.Tensor(
+          "float32",
+          new Float32Array(batch * model.ch * model.tile * model.tile).fill(0.5),
+          [batch, model.ch, model.tile, model.tile],
+        );
+        return feeds;
+      }
+
+      async function timeRuns(session, feeds, n) {
+        const times = [];
+        for (let i = 0; i < n; i++) {
+          const t = performance.now();
+          await session.run(feeds);
+          times.push(performance.now() - t);
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        times.sort((a, b) => a - b);
+        return { median: times[Math.floor(n / 2)], best: times[0] };
+      }
+
+      /* ---- 基础测试 ---- */
+      async function basic(model, ep) {
+        const o = await loadOrt();
+        log(`\n── ${model.name} [${ep}] ──`);
+        let session;
+        try {
+          const t = performance.now();
+          session = await makeSession(o, model.file, ep);
+          log(`  加载: ${(performance.now() - t).toFixed(0)}ms`);
+        } catch (err) {
+          log(`  ✗ 加载失败: ${err.message}`);
+          return { model, ep, error: err.message };
+        }
+
+        const feeds = makeFeed(o, session, model, 1);
+        const tw = performance.now();
+        try {
+          await session.run(feeds);
+        } catch (err) {
+          log(`  ✗ 推理失败: ${err.message}`);
+          session.release?.();
+          return { model, ep, error: err.message };
+        }
+        log(`  warmup: ${(performance.now() - tw).toFixed(0)}ms`);
+
+        const { median, best } = await timeRuns(session, feeds, 10);
+        const tiles = Math.ceil(1920 / model.tile) * Math.ceil(1080 / model.tile);
+        const frameMs = median * tiles;
+        log(`  单块: 中位 ${median.toFixed(2)}ms / 最快 ${best.toFixed(2)}ms  [${model.tile}²]`);
+        log(`  1080p: ${tiles} 块 × ${median.toFixed(2)}ms = ${frameMs.toFixed(0)}ms → ${(1000/frameMs).toFixed(1)} fps`);
+        log(`  距 60fps: 需再快 ${(frameMs / BUDGET_60).toFixed(0)}×`);
+
+        session.release?.();
+        return { model, ep, median, tiles, frameMs };
+      }
+
+      /* ---- 诊断 1: 算子回退 ----
+       * WebGPU 相对单线程 WASM 的加速比若明显偏低（<8x），几乎肯定有算子
+       * 掉回 CPU —— 那会导致每层间 GPU/CPU 同步，GPU 大部分时间在等。
+       * ORT Web 不暴露逐节点 EP 归属的公开 API，故用加速比间接判定。 */
+      async function diagFallback(model) {
+        const o = await loadOrt();
+        log(`\n── 回退诊断: ${model.name} ──`);
+        const out = {};
+        for (const ep of ["webgpu", "wasm"]) {
+          try {
+            const s = await makeSession(o, model.file, ep);
+            const f = makeFeed(o, s, model, 1);
+            await s.run(f);
+            const { median } = await timeRuns(s, f, 6);
+            out[ep] = median;
+            s.release?.();
+          } catch (err) {
+            log(`  ${ep} 失败: ${err.message}`);
+          }
+        }
+        if (out.webgpu && out.wasm) {
+          const ratio = out.wasm / out.webgpu;
+          log(`  WebGPU ${out.webgpu.toFixed(2)}ms vs WASM ${out.wasm.toFixed(2)}ms → 加速 ${ratio.toFixed(1)}×`);
+          if (ratio < 8) {
+            log(`  ⚠ 加速比偏低，很可能有算子回退到 CPU。`);
+            log(`    该模型算子: ${model.name.includes("realesr") ? "Conv/PRelu/DepthToSpace/Resize/Add" : "Conv/Relu/Reshape/Transpose"}`);
+            if (model.name.includes("realesr")) {
+              log(`    嫌疑: PRelu（非 LeakyRelu，是带参数的不同算子）、Resize`);
+            }
+          } else {
+            log(`  ✓ 加速比正常，算子应当全在 GPU 上。`);
+          }
+          out.ratio = ratio;
+        }
+        return out;
+      }
+
+      /* ---- 诊断 2: 批处理 ----
+       * 单块 224² 只有 5 万像素，填不满 M1 的上百个执行单元；且逐块
+       * await 会在每块之间插入完整的 JS→GPU→JS 往返。批处理若能把多块
+       * 合成一次提交，可同时改善并行度与调度开销。 */
+      async function diagBatch(model) {
+        const o = await loadOrt();
+        log(`\n── 批处理诊断: ${model.name} ──`);
+        let session;
+        try {
+          session = await makeSession(o, model.file, "webgpu");
+        } catch (err) {
+          log(`  ✗ ${err.message}`);
+          return null;
+        }
+
+        const tiles = Math.ceil(1920 / model.tile) * Math.ceil(1080 / model.tile);
+        const results = [];
+        for (const batch of [1, 4, 8, 16]) {
+          if (batch > tiles) break;
+          try {
+            const feeds = makeFeed(o, session, model, batch);
+            await session.run(feeds);       // warmup 该 shape
+            const { median } = await timeRuns(session, feeds, 5);
+            const perTile = median / batch;
+            const frameMs = perTile * tiles;
+            log(`  batch=${String(batch).padStart(2)}: ${median.toFixed(2)}ms 总 · ` +
+                `${perTile.toFixed(2)}ms/块 · 1080p ≈ ${frameMs.toFixed(0)}ms → ` +
+                `${(1000/frameMs).toFixed(1)} fps`);
+            results.push({ batch, perTile, frameMs });
+          } catch (err) {
+            log(`  batch=${batch}: 不支持 — ${err.message.slice(0, 120)}`);
+            break;
+          }
+        }
+        session.release?.();
+
+        if (results.length > 1) {
+          const gain = results[0].perTile / results[results.length - 1].perTile;
+          log(`  批处理增益: ${gain.toFixed(2)}× (batch=1 → ${results[results.length-1].batch})`);
+          if (gain < 1.3) {
+            log(`  ⚠ 增益很小 —— 瓶颈不在调度开销，而在实际算力或内存带宽。`);
+          }
+        } else if (results.length === 1) {
+          log(`  ⚠ 仅支持 batch=1（Reshape 常量 shape 把 batch 也钉死了），`);
+          log(`    无法通过批处理提升 GPU 利用率。`);
+        }
+        return results;
+      }
+
+      /* ---- 诊断 3: 并行提交 ----
+       * 不逐块 await，而是同时发起多个 run 让 ORT/驱动自行流水。
+       * 这能揭示"串行等待"占了多少时间。 */
+      async function diagConcurrent(model) {
+        const o = await loadOrt();
+        log(`\n── 并行提交诊断: ${model.name} ──`);
+        let session;
+        try {
+          session = await makeSession(o, model.file, "webgpu");
+        } catch (err) {
+          log(`  ✗ ${err.message}`);
+          return null;
+        }
+        const feeds = makeFeed(o, session, model, 1);
+        await session.run(feeds);
+
+        for (const par of [1, 4, 8]) {
+          const t = performance.now();
+          // 注意：同一 session 并发 run 在 ORT 中会被串行化，这里测的是
+          // 去掉 JS 层 await 往返后的净收益
+          await Promise.all(Array.from({ length: par }, () => session.run(feeds)));
+          const total = performance.now() - t;
+          log(`  并行 ${String(par).padStart(2)} 次: 总 ${total.toFixed(2)}ms · ` +
+              `${(total / par).toFixed(2)}ms/次`);
+        }
+        session.release?.();
+      }
+
+      /* ---- 诊断 4: 与纯 shader 对比 ----
+       * 拿本项目实际使用的 EASU shader 处理同等像素量，作为"这块 GPU 在
+       * 纯 shader 工作负载下有多快"的参照。CNN 与它的差距即为模型本身
+       * 的代价，与 GPU 能力无关。 */
+      async function diagShaderBaseline() {
+        log(`\n── 纯 shader 参照 (EASU) ──`);
+        if (!adapter) { log(`  ✗ 无 WebGPU adapter`); return; }
+        if (!device) device = await adapter.requestDevice();
+
+        let code = await (await fetch("../src/easu.wgsl")).text();
+        const module = device.createShaderModule({ code });
+        const info = await module.getCompilationInfo();
+        if (info.messages.some((m) => m.type === "error")) {
+          log(`  ✗ easu.wgsl 编译失败`);
           return;
         }
 
-        if (adapterInfo) {
-          log(`GPU: ${[adapterInfo.vendor, adapterInfo.architecture].filter(Boolean).join(" ") || "(受限)"}`);
-        }
+        const FORMAT = "rgba8unorm";
+        const pipeline = device.createRenderPipeline({
+          layout: "auto",
+          vertex: { module, entryPoint: "vs_main" },
+          fragment: { module, entryPoint: "fs_main", targets: [{ format: FORMAT }] },
+          primitive: { topology: "triangle-list" },
+        });
+        const sampler = device.createSampler({
+          magFilter: "linear", minFilter: "linear",
+          addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge",
+        });
 
-        const results = [];
-        for (const ep of eps) {
-          for (const model of MODELS) {
-            results.push(await benchmark(model, ep));
-            renderResults(results);
+        for (const [sw, sh, dw, dh, label] of [
+          [1920, 1080, 2560, 1440, "1080p → 2K"],
+          [1920, 1080, 3840, 2160, "1080p → 4K"],
+        ]) {
+          const src = device.createTexture({
+            size: [sw, sh], format: FORMAT,
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+          });
+          const dst = device.createTexture({
+            size: [dw, dh], format: FORMAT,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+          });
+          const bg = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: src.createView() },
+              { binding: 1, resource: sampler },
+            ],
+          });
+
+          // warmup
+          for (let i = 0; i < 3; i++) {
+            const e = device.createCommandEncoder();
+            const p = e.beginRenderPass({
+              colorAttachments: [{
+                view: dst.createView(), loadOp: "clear",
+                clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: "store",
+              }],
+            });
+            p.setPipeline(pipeline); p.setBindGroup(0, bg); p.draw(3); p.end();
+            device.queue.submit([e.finish()]);
+          }
+          await device.queue.onSubmittedWorkDone();
+
+          const N = 20;
+          const t = performance.now();
+          for (let i = 0; i < N; i++) {
+            const e = device.createCommandEncoder();
+            const p = e.beginRenderPass({
+              colorAttachments: [{
+                view: dst.createView(), loadOp: "clear",
+                clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: "store",
+              }],
+            });
+            p.setPipeline(pipeline); p.setBindGroup(0, bg); p.draw(3); p.end();
+            device.queue.submit([e.finish()]);
+          }
+          await device.queue.onSubmittedWorkDone();
+          const per = (performance.now() - t) / N;
+          log(`  EASU ${label}: ${per.toFixed(2)}ms/帧 → ${(1000/per).toFixed(0)} fps`);
+          src.destroy(); dst.destroy();
+        }
+        log(`  ↑ 这是本项目实际使用的方案，作为同一 GPU 的能力参照。`);
+      }
+
+      /* ---- 编排 ---- */
+      function judge(results) {
+        const good = results.filter((r) => r && !r.error && r.frameMs);
+        if (!good.length) { setVerdict("bad", "无有效结果"); return; }
+        const best = good.reduce((a, b) => (a.frameMs < b.frameMs ? a : b));
+        const fps = 1000 / best.frameMs;
+        if (best.frameMs <= BUDGET_60) {
+          setVerdict("ok", `可行：${best.model.name} 达 ${fps.toFixed(1)} fps，满足 60fps。`);
+        } else if (best.frameMs <= BUDGET_30) {
+          setVerdict("warn", `勉强：最优 ${fps.toFixed(1)} fps，够 30fps 但无余量。`);
+        } else {
+          setVerdict("bad",
+            `不可行：最优仅 ${fps.toFixed(1)} fps，距 60fps 需再快 ` +
+            `${(best.frameMs / BUDGET_60).toFixed(0)} 倍。EASU 纯 shader 方案更合适。`);
+        }
+      }
+
+      async function run(mode) {
+        const btns = [...document.querySelectorAll("button")];
+        btns.forEach((b) => (b.disabled = true));
+        lines.length = 0;
+        log(`开始 — ${new Date().toLocaleTimeString()}  模式: ${mode}`);
+
+        if (await checkModels()) {
+          const results = [];
+          const eps = mode === "wasm" ? ["webgpu", "wasm"] : ["webgpu"];
+          for (const ep of eps) {
+            for (const model of MODELS) results.push(await basic(model, ep));
+          }
+          judge(results);
+
+          if (mode === "full") {
+            log(`\n${"═".repeat(56)}`);
+            log(`GPU 利用率诊断`);
+            log("═".repeat(56));
+            for (const model of MODELS) {
+              await diagFallback(model);
+              await diagBatch(model);
+              await diagConcurrent(model);
+            }
+            await diagShaderBaseline();
           }
         }
+
         log(`\n完成。`);
         btns.forEach((b) => (b.disabled = false));
       }
 
-      document.getElementById("run").addEventListener("click", () => runAll(["webgpu"]));
-      document.getElementById("runWasm").addEventListener("click", () =>
-        runAll(["webgpu", "wasm"]));
+      document.getElementById("run").addEventListener("click", () => run("basic"));
+      document.getElementById("runFull").addEventListener("click", () => run("full"));
+      document.getElementById("runWasm").addEventListener("click", () => run("wasm"));
     </script>
   </body>
 </html>
