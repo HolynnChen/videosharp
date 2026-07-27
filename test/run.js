@@ -62,7 +62,7 @@ function serve() {
   });
   page.on("pageerror", (e) => consoleErrors.push("pageerror: " + e.message));
 
-  const url = `http://127.0.0.1:${port}/test/rcas.test.html`;
+  const url = `http://127.0.0.1:${port}/test/shaders.test.html`;
   await page.goto(url);
 
   let result;
@@ -76,7 +76,7 @@ function serve() {
   await browser.close();
   server.close();
 
-  console.log("=== RCAS shader 测试 ===");
+  console.log("=== VidSharp shader 测试 ===");
   for (const line of result.log) console.log("  " + line);
   if (consoleErrors.length) {
     console.log("--- 浏览器控制台错误 ---");

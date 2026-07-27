@@ -7,12 +7,15 @@
         color-scheme: light dark;
       }
       body {
-        width: 260px;
+        width: 272px;
         margin: 0;
         padding: 16px;
         font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
       }
       h1 {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
         margin: 0 0 14px;
         font-size: 15px;
         font-weight: 600;
@@ -21,21 +24,42 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 14px;
+        margin-bottom: 12px;
       }
       label {
         user-select: none;
       }
+      .slider {
+        margin-bottom: 12px;
+      }
+      .slider > .row {
+        margin-bottom: 2px;
+      }
       input[type="range"] {
         width: 100%;
+        margin: 0;
+      }
+      select {
+        font: inherit;
+        padding: 2px 4px;
       }
       .value {
         font-variant-numeric: tabular-nums;
-        opacity: 0.7;
+        opacity: 0.65;
+      }
+      .section {
+        margin: 14px 0 10px;
+        padding-top: 12px;
+        border-top: 1px solid rgba(128, 128, 128, 0.25);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        opacity: 0.5;
       }
       .hint {
-        margin: 0;
-        padding-top: 12px;
+        margin: 12px 0 0;
+        padding-top: 10px;
         border-top: 1px solid rgba(128, 128, 128, 0.25);
         font-size: 11px;
         line-height: 1.5;
@@ -50,40 +74,87 @@
         color: #d33;
         font-size: 12px;
       }
+      fieldset {
+        margin: 0;
+        padding: 0;
+        border: 0;
+      }
+      fieldset[disabled] {
+        opacity: 0.45;
+        pointer-events: none;
+      }
     </style>
   </head>
   <body>
-    <h1>VidSharp</h1>
+    <h1>
+      VidSharp
+      <input type="checkbox" id="enabled" />
+    </h1>
 
     <div id="unsupported">此浏览器不支持 WebGPU，扩展无法工作。</div>
 
-    <div class="row">
-      <label for="enabled">启用锐化</label>
-      <input type="checkbox" id="enabled" />
-    </div>
-
-    <div>
-      <div class="row" style="margin-bottom: 4px">
-        <label for="strength">强度</label>
-        <span class="value" id="strengthValue">50</span>
+    <fieldset id="controls">
+      <div class="row">
+        <label for="upscale">超分辨率</label>
+        <select id="upscale">
+          <option value="off">关闭</option>
+          <option value="2k">放大到 2K</option>
+          <option value="4k">放大到 4K</option>
+          <option value="2x">2 倍放大</option>
+        </select>
       </div>
-      <input type="range" id="strength" min="0" max="100" step="5" />
-    </div>
 
-    <div class="row" style="margin-top: 14px">
-      <label for="denoise">噪声抑制</label>
-      <input type="checkbox" id="denoise" />
-    </div>
+      <div class="section">锐化</div>
 
-    <div class="row">
-      <label for="splitPreview" title="只锐化画面左半边，便于左右对比">
-        分屏对比
-      </label>
-      <input type="checkbox" id="splitPreview" />
-    </div>
+      <div class="slider">
+        <div class="row">
+          <label for="strength">强度</label>
+          <span class="value" id="strengthValue">50</span>
+        </div>
+        <input type="range" id="strength" min="0" max="100" step="5" />
+      </div>
+
+      <div class="row">
+        <label for="denoise">噪声抑制</label>
+        <input type="checkbox" id="denoise" />
+      </div>
+
+      <div class="section">画质修复</div>
+
+      <div class="slider">
+        <div class="row">
+          <label for="deblock" title="消除低码率视频的方块状伪影">去块</label>
+          <span class="value" id="deblockValue">40</span>
+        </div>
+        <input type="range" id="deblock" min="0" max="100" step="5" />
+      </div>
+
+      <div class="slider">
+        <div class="row">
+          <label for="deband" title="消除天空、渐变面上的条纹">去色带</label>
+          <span class="value" id="debandValue">30</span>
+        </div>
+        <input type="range" id="deband" min="0" max="100" step="5" />
+      </div>
+
+      <div class="slider">
+        <div class="row">
+          <label for="contrast" title="提升暗部与局部细节">局部对比度</label>
+          <span class="value" id="contrastValue">25</span>
+        </div>
+        <input type="range" id="contrast" min="0" max="100" step="5" />
+      </div>
+
+      <div class="section">对比</div>
+
+      <div class="row">
+        <label for="compare" title="拖动分割条对比处理前后">拖动对比</label>
+        <input type="checkbox" id="compare" />
+      </div>
+    </fieldset>
 
     <p class="hint">
-      设置对所有站点生效，切换后立即应用。<br />
+      左侧为处理后，右侧为原始画面。<br />
       受 DRM 保护的视频（Netflix 等）无法处理。
     </p>
 

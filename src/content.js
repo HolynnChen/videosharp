@@ -1,31 +1,83 @@
-/* VidSharp — WebGPU RCAS 视频锐化
+/* VidSharp — WebGPU 视频增强
  *
- * 管线：<video> --importExternalTexture--> RCAS fragment shader --> <canvas>
+ * 三 pass 管线（顺序有讲究）：
  *
- * 关键约束（踩过的坑，改代码前先读）：
- *   - external texture 单帧有效：每帧必须重新 importExternalTexture，
- *     并且 bind group 也必须每帧重建（纹理对象变了）。
- *   - requestVideoFrameCallback 只在有新解码帧时触发，比 rAF 更省电，
- *     且天然与视频帧率对齐（30fps 视频不会白跑 60 次）。
- *   - DRM/EME 视频拿不到像素，importExternalTexture 会抛错或全黑，
- *     这里靠 consecutiveFailures 检测并自动退出，不硬扛。
+ *   <video> --importExternalTexture-->
+ *     [1] enhance  去块 + 去色带 + 局部对比度   (源分辨率)
+ *     [2] easu     方向自适应放大               (→ 目标分辨率)
+ *     [3] rcas     自适应锐化                   (目标分辨率)
+ *   --> <canvas>
+ *
+ * 为什么是这个顺序：
+ *   - 去块必须在放大前：否则 EASU 会把块边界当真实边缘"保护"，块效应被锐化。
+ *   - 锐化必须在放大后：放大前锐化会被插值重新糊掉。
+ *
+ * 关键约束（改代码前先读）：
+ *   - external texture 单帧有效：每帧重新 import，bind group 也必须重建。
+ *   - 覆盖层不能压过弹幕/控制条：插到 video 的直接后继位置，继承 video 的
+ *     层级，而不是把 z-index 顶到最大（那样会盖住播放器 UI）。
+ *   - DRM 视频取不到像素，靠 consecutiveFailures 检测后自动退出。
  */
 
-const SHADER_URL = chrome.runtime.getURL("src/rcas.wgsl");
+const SHADERS = {
+  enhance: chrome.runtime.getURL("src/enhance.wgsl"),
+  easu: chrome.runtime.getURL("src/easu.wgsl"),
+  rcas: chrome.runtime.getURL("src/rcas.wgsl"),
+};
 
 const DEFAULTS = {
   enabled: false,
-  // 用户面板上的 0~100，线性映射到 RCAS sharpness
-  strength: 50,
-  denoise: true,
-  // 诊断用：只锐化左半边，便于左右对比确认生效
-  splitPreview: false,
+  strength: 50,      // RCAS 锐化 0~100
+  denoise: true,     // RCAS 噪声抑制
+  deblock: 40,       // 去块 0~100
+  deband: 30,        // 去色带 0~100
+  contrast: 25,      // 局部对比度 0~100
+  upscale: "2k",     // off | 2k | 4k | 2x
+  compare: false,    // 拖动对比模式
 };
 
 let settings = { ...DEFAULTS };
-const active = new WeakMap(); // video -> Session
+const active = new WeakMap();
 
-/* ---------- WebGPU 设备（全页面共享一个） ---------- */
+/* ---------- 目标分辨率 ---------- */
+
+const UPSCALE_TARGETS = {
+  "2k": 2560,
+  "4k": 3840,
+};
+
+/** 计算输出尺寸。保持宽高比，不放大已经足够大的视频，受 GPU 纹理上限约束。 */
+function computeOutputSize(videoW, videoH, mode, maxDim) {
+  if (mode === "off" || !videoW || !videoH) {
+    return { w: videoW, h: videoH };
+  }
+
+  let scale;
+  if (mode === "2x") {
+    scale = 2;
+  } else {
+    const targetW = UPSCALE_TARGETS[mode];
+    if (!targetW) return { w: videoW, h: videoH };
+    // 已达到或超过目标宽度就不放大 —— 下采样只会损失画质
+    if (videoW >= targetW) return { w: videoW, h: videoH };
+    scale = targetW / videoW;
+  }
+
+  // 受纹理上限约束（M1 是 8192）
+  const limit = Math.min(
+    maxDim / videoW,
+    maxDim / videoH,
+  );
+  scale = Math.min(scale, limit);
+  if (scale <= 1) return { w: videoW, h: videoH };
+
+  return {
+    w: Math.round(videoW * scale),
+    h: Math.round(videoH * scale),
+  };
+}
+
+/* ---------- WebGPU 设备 ---------- */
 
 let devicePromise = null;
 
@@ -36,7 +88,6 @@ function getDevice() {
       const adapter = await navigator.gpu.requestAdapter();
       if (!adapter) throw new Error("无法获取 GPU adapter");
       const device = await adapter.requestDevice();
-      // 设备意外丢失（驱动重置、标签页休眠）时清空缓存，下次重新申请
       device.lost.then((info) => {
         console.warn("[VidSharp] GPU 设备丢失:", info.message);
         devicePromise = null;
@@ -52,14 +103,19 @@ function getDevice() {
 }
 
 let shaderCache = null;
-async function getShaderCode() {
+function getShaders() {
   if (!shaderCache) {
-    shaderCache = fetch(SHADER_URL).then((r) => r.text());
+    shaderCache = Promise.all(
+      Object.entries(SHADERS).map(([name, url]) =>
+        fetch(url).then((r) => r.text()).then((code) => [name, code]),
+      ),
+    ).then(Object.fromEntries);
+    shaderCache.catch(() => { shaderCache = null; });
   }
   return shaderCache;
 }
 
-/* ---------- 单个视频的处理会话 ---------- */
+/* ---------- 处理会话 ---------- */
 
 class Session {
   constructor(video) {
@@ -67,26 +123,30 @@ class Session {
     this.canvas = null;
     this.ctx = null;
     this.device = null;
-    this.pipeline = null;
+    this.pipelines = {};
     this.sampler = null;
-    this.uniformBuffer = null;
+    this.enhanceUniform = null;
+    this.rcasUniform = null;
+    this.intermediates = { enhanced: null, upscaled: null };
     this.rvfcHandle = null;
     this.running = false;
     this.consecutiveFailures = 0;
-    this.lastSize = { w: 0, h: 0 };
-    this.onResize = this.onResize.bind(this);
+    this.frameCount = 0;
+    this.srcSize = { w: 0, h: 0 };
+    this.outSize = { w: 0, h: 0 };
+    this.divider = null;
+    this.compareRatio = 0.5;
     this.renderFrame = this.renderFrame.bind(this);
+    this.syncSizes = this.syncSizes.bind(this);
   }
 
   async start() {
     if (this.running) return;
-
     if (!("requestVideoFrameCallback" in HTMLVideoElement.prototype)) {
       throw new Error("此浏览器不支持 requestVideoFrameCallback");
     }
 
-    const device = await getDevice();
-    const code = await getShaderCode();
+    const [device, shaders] = await Promise.all([getDevice(), getShaders()]);
     this.device = device;
 
     this.canvas = document.createElement("canvas");
@@ -95,24 +155,21 @@ class Session {
     if (!this.ctx) throw new Error("无法创建 WebGPU canvas context");
 
     this.format = navigator.gpu.getPreferredCanvasFormat();
-    this.ctx.configure({
-      device,
-      format: this.format,
-      alphaMode: "opaque",
-    });
+    this.ctx.configure({ device, format: this.format, alphaMode: "opaque" });
 
-    const module = device.createShaderModule({ code, label: "rcas" });
-    this.pipeline = device.createRenderPipeline({
-      label: "rcas-pipeline",
-      layout: "auto",
-      vertex: { module, entryPoint: "vs_main" },
-      fragment: {
-        module,
-        entryPoint: "fs_main",
-        targets: [{ format: this.format }],
-      },
-      primitive: { topology: "triangle-list" },
-    });
+    // 中间纹理用 rgba16float：多 pass 串联时避免 8bit 量化累积误差，
+    // 尤其去色带的亚量化级抖动在 8bit 中间纹理里会被直接抹掉。
+    this.interFormat = "rgba16float";
+
+    this.pipelines.enhance = this.buildPipeline(
+      shaders.enhance, "enhance", this.interFormat, true,
+    );
+    this.pipelines.easu = this.buildPipeline(
+      shaders.easu, "easu", this.interFormat, false,
+    );
+    this.pipelines.rcas = this.buildPipeline(
+      shaders.rcas, "rcas", this.format, true,
+    );
 
     this.sampler = device.createSampler({
       magFilter: "linear",
@@ -121,8 +178,11 @@ class Session {
       addressModeV: "clamp-to-edge",
     });
 
-    // 4 x f32：sharpness, denoise, 2 x padding
-    this.uniformBuffer = device.createBuffer({
+    this.enhanceUniform = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.rcasUniform = device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -133,141 +193,265 @@ class Session {
     this.scheduleNext();
   }
 
-  /* 选择挂载点：向上找到仍与 video 尺寸基本一致的最外层祖先。
-   *
-   * 为什么不能直接用 parentElement：B 站等站点的弹幕层、字幕层往往是
-   * video 父元素的兄弟节点，此时无论 canvas 的 z-index 多高都会被盖住
-   * （z-index 只在同一层叠上下文内可比）。挂到共同祖先才能真正盖在最上面。
-   *
-   * 尺寸偏差阈值取 2px，容忍边框和亚像素布局；一旦祖先明显变大就停止，
-   * 避免挂到整个页面上导致覆盖层错位。
-   */
-  pickMountPoint() {
-    const videoRect = this.video.getBoundingClientRect();
-    let best = this.video.parentElement;
-    let node = best;
-
-    for (let depth = 0; node && depth < 4; depth++) {
-      const rect = node.getBoundingClientRect();
-      const fits =
-        Math.abs(rect.width - videoRect.width) <= 2 &&
-        Math.abs(rect.height - videoRect.height) <= 2;
-      if (!fits) break;
-      best = node;
-      node = node.parentElement;
-    }
-
-    return best;
+  buildPipeline(code, label, targetFormat, external) {
+    const module = this.device.createShaderModule({ code, label });
+    return this.device.createRenderPipeline({
+      label: `${label}-pipeline`,
+      layout: "auto",
+      vertex: { module, entryPoint: "vs_main" },
+      fragment: {
+        module,
+        entryPoint: "fs_main",
+        targets: [{ format: targetFormat }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
   }
+
+  /* ---- 挂载：不遮挡播放器 UI ---- */
 
   attachOverlay() {
-    const parent = this.pickMountPoint();
+    const parent = this.video.parentElement;
     if (!parent) throw new Error("video 没有父元素，无法挂载");
 
-    // 覆盖层需要一个定位上下文；static 时补成 relative
     if (getComputedStyle(parent).position === "static") {
       parent.style.position = "relative";
-      this.patchedParentPosition = parent;
-    }
-    parent.appendChild(this.canvas);
-
-    if (settings.splitPreview) {
-      this.canvas.classList.add("vidsharp-split");
+      this.patchedParent = parent;
     }
 
-    this.resizeObserver = new ResizeObserver(this.onResize);
+    // 插到 video 的紧后面：DOM 顺序上压过 video 本身，但仍在弹幕层、
+    // 控制条（它们是后续兄弟节点或更高层级容器）之下。
+    // 这比把 z-index 顶到最大更正确 —— 后者会盖住所有播放器 UI。
+    this.video.insertAdjacentElement("afterend", this.canvas);
+
+    this.resizeObserver = new ResizeObserver(this.syncSizes);
     this.resizeObserver.observe(this.video);
-    this.onResize();
+    this.syncSizes();
+    this.setupCompare();
   }
 
-  applySplitPreview() {
-    this.canvas?.classList.toggle("vidsharp-split", !!settings.splitPreview);
+  syncSizes() {
+    if (!this.canvas || !this.device) return;
+    const vw = this.video.videoWidth;
+    const vh = this.video.videoHeight;
+    if (!vw || !vh) return;
+
+    const maxDim = this.device.limits.maxTextureDimension2D;
+    const out = computeOutputSize(vw, vh, settings.upscale, maxDim);
+
+    const srcChanged = vw !== this.srcSize.w || vh !== this.srcSize.h;
+    const outChanged = out.w !== this.outSize.w || out.h !== this.outSize.h;
+    if (!srcChanged && !outChanged) return;
+
+    this.srcSize = { w: vw, h: vh };
+    this.outSize = out;
+    this.canvas.width = out.w;
+    this.canvas.height = out.h;
+
+    this.rebuildIntermediates();
   }
 
-  onResize() {
+  rebuildIntermediates() {
+    const { device, interFormat } = this;
+    this.intermediates.enhanced?.destroy();
+    this.intermediates.upscaled?.destroy();
+
+    const usage =
+      GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+
+    this.intermediates.enhanced = device.createTexture({
+      label: "enhanced",
+      size: [this.srcSize.w, this.srcSize.h],
+      format: interFormat,
+      usage,
+    });
+
+    // 放大后的中间纹理。若不放大则与源尺寸相同，仍需独立纹理（不能读写同一张）。
+    this.intermediates.upscaled = device.createTexture({
+      label: "upscaled",
+      size: [this.outSize.w, this.outSize.h],
+      format: interFormat,
+      usage,
+    });
+  }
+
+  /* ---- 拖动对比 ---- */
+
+  setupCompare() {
+    if (!settings.compare) return;
+
+    const divider = document.createElement("div");
+    divider.className = "vidsharp-divider";
+    divider.innerHTML =
+      '<div class="vidsharp-divider-line"></div>' +
+      '<div class="vidsharp-divider-handle">⇔</div>';
+    this.divider = divider;
+    this.canvas.parentElement.appendChild(divider);
+
+    const setRatio = (clientX) => {
+      const rect = this.video.getBoundingClientRect();
+      if (!rect.width) return;
+      this.compareRatio = Math.min(
+        1, Math.max(0, (clientX - rect.left) / rect.width),
+      );
+      this.applyCompare();
+    };
+
+    let dragging = false;
+    const onDown = (ev) => {
+      dragging = true;
+      divider.setPointerCapture?.(ev.pointerId);
+      setRatio(ev.clientX);
+      ev.preventDefault();
+      ev.stopPropagation();
+    };
+    const onMove = (ev) => {
+      if (!dragging) return;
+      setRatio(ev.clientX);
+      ev.preventDefault();
+      ev.stopPropagation();
+    };
+    const onUp = (ev) => {
+      dragging = false;
+      divider.releasePointerCapture?.(ev.pointerId);
+    };
+
+    divider.addEventListener("pointerdown", onDown);
+    divider.addEventListener("pointermove", onMove);
+    divider.addEventListener("pointerup", onUp);
+    divider.addEventListener("pointercancel", onUp);
+    this.compareHandlers = { divider, onDown, onMove, onUp };
+
+    this.applyCompare();
+  }
+
+  applyCompare() {
     if (!this.canvas) return;
-    // 后备分辨率跟随视频原始分辨率，而非 CSS 尺寸 —— 锐化要在源分辨率上做才准确
-    const w = this.video.videoWidth;
-    const h = this.video.videoHeight;
-    if (!w || !h) return;
-    if (w !== this.lastSize.w || h !== this.lastSize.h) {
-      const max = this.device.limits.maxTextureDimension2D;
-      this.canvas.width = Math.min(w, max);
-      this.canvas.height = Math.min(h, max);
-      this.lastSize = { w, h };
+    if (settings.compare) {
+      const pct = (this.compareRatio * 100).toFixed(2);
+      // 只显示左侧处理结果，右侧透出原始 video
+      this.canvas.style.clipPath = `inset(0 ${(100 - pct).toFixed(2)}% 0 0)`;
+      if (this.divider) this.divider.style.left = `${pct}%`;
+    } else {
+      this.canvas.style.clipPath = "";
     }
   }
+
+  teardownCompare() {
+    if (this.compareHandlers) {
+      const { divider, onDown, onMove, onUp } = this.compareHandlers;
+      divider.removeEventListener("pointerdown", onDown);
+      divider.removeEventListener("pointermove", onMove);
+      divider.removeEventListener("pointerup", onUp);
+      divider.removeEventListener("pointercancel", onUp);
+      this.compareHandlers = null;
+    }
+    this.divider?.remove();
+    this.divider = null;
+    if (this.canvas) this.canvas.style.clipPath = "";
+  }
+
+  refreshCompare() {
+    this.teardownCompare();
+    if (settings.compare && this.canvas?.parentElement) this.setupCompare();
+  }
+
+  /* ---- uniforms ---- */
 
   updateUniforms() {
-    if (!this.uniformBuffer) return;
-    // 面板 0~100 直接线性映射到 RCAS 的 sharpness 系数 0~1。
-    // 不用 FSR 原版的 exp2(-stops) 曲线：那条曲线为渲染管线的 1~2 stops
-    // 微调设计，映射到 0~100 后整个区间会被压在几乎不可见的弱效果段。
-    const sharpness = Math.max(0, Math.min(1, settings.strength / 100));
-    const data = new Float32Array([
-      sharpness,
-      settings.denoise ? 1.0 : 0.0,
+    if (!this.enhanceUniform) return;
+    const pct = (v) => Math.max(0, Math.min(1, v / 100));
+
+    this.device.queue.writeBuffer(this.enhanceUniform, 0, new Float32Array([
+      pct(settings.deblock),
+      pct(settings.deband),
+      pct(settings.contrast),
+      this.frameCount % 1024,
+    ]));
+
+    this.device.queue.writeBuffer(this.rcasUniform, 0, new Float32Array([
+      pct(settings.strength),
+      settings.denoise ? 1 : 0,
       0,
       0,
-    ]);
-    this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
+    ]));
   }
+
+  /* ---- 渲染 ---- */
 
   scheduleNext() {
     if (!this.running) return;
     this.rvfcHandle = this.video.requestVideoFrameCallback(this.renderFrame);
   }
 
+  drawPass(encoder, pipeline, entries, targetView) {
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries,
+    });
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: targetView,
+        loadOp: "clear",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        storeOp: "store",
+      }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(3);
+    pass.end();
+  }
+
   renderFrame() {
     if (!this.running) return;
 
     try {
-      this.onResize();
+      this.syncSizes();
       if (!this.canvas.width || !this.canvas.height) {
         this.scheduleNext();
         return;
       }
 
-      // 每帧都要重新导入：external texture 只对当前帧有效
-      const externalTexture = this.device.importExternalTexture({
+      this.frameCount++;
+      // 去色带抖动需要每帧变化，否则固定噪点图案会被眼睛识别为脏点
+      if (settings.deband > 0) this.updateUniforms();
+
+      const external = this.device.importExternalTexture({
         source: this.video,
       });
 
-      const bindGroup = this.device.createBindGroup({
-        layout: this.pipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: externalTexture },
-          { binding: 1, resource: this.sampler },
-          { binding: 2, resource: { buffer: this.uniformBuffer } },
-        ],
-      });
-
       const encoder = this.device.createCommandEncoder();
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [
-          {
-            view: this.ctx.getCurrentTexture().createView(),
-            loadOp: "clear",
-            clearValue: { r: 0, g: 0, b: 0, a: 1 },
-            storeOp: "store",
-          },
-        ],
-      });
-      pass.setPipeline(this.pipeline);
-      pass.setBindGroup(0, bindGroup);
-      pass.draw(3);
-      pass.end();
+
+      // Pass 1: enhance（源分辨率）
+      this.drawPass(encoder, this.pipelines.enhance, [
+        { binding: 0, resource: external },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: this.enhanceUniform } },
+      ], this.intermediates.enhanced.createView());
+
+      // Pass 2: EASU 放大
+      this.drawPass(encoder, this.pipelines.easu, [
+        { binding: 0, resource: this.intermediates.enhanced.createView() },
+        { binding: 1, resource: this.sampler },
+      ], this.intermediates.upscaled.createView());
+
+      // Pass 3: RCAS 锐化 → canvas
+      this.drawPass(encoder, this.pipelines.rcas, [
+        { binding: 0, resource: this.intermediates.upscaled.createView() },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: this.rcasUniform } },
+      ], this.ctx.getCurrentTexture().createView());
+
       this.device.queue.submit([encoder.finish()]);
 
       this.consecutiveFailures = 0;
       this.canvas.classList.add("vidsharp-visible");
     } catch (err) {
       this.consecutiveFailures++;
-      // DRM 视频会稳定失败，重试无意义，直接放弃并提示
       if (this.consecutiveFailures >= 5) {
         console.warn(
-          "[VidSharp] 连续取帧失败，可能是 DRM 保护的视频，已停止处理。",
-          err,
+          "[VidSharp] 连续取帧失败，可能是 DRM 保护的视频，已停止处理。", err,
         );
         this.stop();
         notify("此视频受 DRM 保护，无法处理");
@@ -286,14 +470,20 @@ class Session {
     }
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    this.teardownCompare();
     this.canvas?.remove();
     this.canvas = null;
     this.ctx = null;
-    this.uniformBuffer?.destroy?.();
-    this.uniformBuffer = null;
-    if (this.patchedParentPosition) {
-      this.patchedParentPosition.style.position = "";
-      this.patchedParentPosition = null;
+    this.intermediates.enhanced?.destroy();
+    this.intermediates.upscaled?.destroy();
+    this.intermediates = { enhanced: null, upscaled: null };
+    this.enhanceUniform?.destroy?.();
+    this.rcasUniform?.destroy?.();
+    this.enhanceUniform = null;
+    this.rcasUniform = null;
+    if (this.patchedParent) {
+      this.patchedParent.style.position = "";
+      this.patchedParent = null;
     }
     active.delete(this.video);
   }
@@ -322,17 +512,12 @@ async function enableFor(video) {
   }
 }
 
-function disableFor(video) {
-  active.get(video)?.stop();
-}
-
 function applyToAll() {
-  const videos = document.querySelectorAll("video");
-  for (const video of videos) {
+  for (const video of document.querySelectorAll("video")) {
     if (settings.enabled && isProcessable(video)) {
       enableFor(video);
     } else if (!settings.enabled) {
-      disableFor(video);
+      active.get(video)?.stop();
     }
   }
 }
@@ -347,7 +532,6 @@ function notify(message) {
 
 /* ---------- 生命周期 ---------- */
 
-// 新插入的 video（SPA 站点很常见）
 const observer = new MutationObserver(() => {
   if (settings.enabled) applyToAll();
 });
@@ -363,33 +547,34 @@ function init() {
     subtree: true,
   });
 
-  // 视频元数据加载完才知道 videoWidth，此时才能启动
-  document.addEventListener(
-    "loadedmetadata",
-    (e) => {
-      if (settings.enabled && e.target instanceof HTMLVideoElement) {
-        enableFor(e.target);
-      }
-    },
-    true,
-  );
+  document.addEventListener("loadedmetadata", (e) => {
+    if (settings.enabled && e.target instanceof HTMLVideoElement) {
+      enableFor(e.target);
+    }
+  }, true);
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "sync") return;
-    let needsReapply = false;
+
+    let reapply = false;
+    let resize = false;
+    let compare = false;
     for (const [key, { newValue }] of Object.entries(changes)) {
-      if (key in DEFAULTS) {
-        settings[key] = newValue;
-        if (key === "enabled") needsReapply = true;
-      }
+      if (!(key in DEFAULTS)) continue;
+      settings[key] = newValue;
+      if (key === "enabled") reapply = true;
+      if (key === "upscale") resize = true;
+      if (key === "compare") compare = true;
     }
+
     for (const video of document.querySelectorAll("video")) {
       const session = active.get(video);
       if (!session) continue;
       session.updateUniforms();
-      session.applySplitPreview();
+      if (resize) session.syncSizes();
+      if (compare) session.refreshCompare();
     }
-    if (needsReapply) applyToAll();
+    if (reapply) applyToAll();
   });
 }
 

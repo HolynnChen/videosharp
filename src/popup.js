@@ -2,41 +2,52 @@ const DEFAULTS = {
   enabled: false,
   strength: 50,
   denoise: true,
-  splitPreview: false,
+  deblock: 40,
+  deband: 30,
+  contrast: 25,
+  upscale: "2k",
+  compare: false,
 };
 
-const enabledEl = document.getElementById("enabled");
-const strengthEl = document.getElementById("strength");
-const strengthValueEl = document.getElementById("strengthValue");
-const denoiseEl = document.getElementById("denoise");
-const splitPreviewEl = document.getElementById("splitPreview");
+const SLIDERS = ["strength", "deblock", "deband", "contrast"];
+const CHECKBOXES = ["enabled", "denoise", "compare"];
+
+const el = (id) => document.getElementById(id);
 
 if (!navigator.gpu) {
-  document.getElementById("unsupported").style.display = "block";
+  el("unsupported").style.display = "block";
+}
+
+function syncEnabledState(enabled) {
+  el("controls").toggleAttribute("disabled", !enabled);
 }
 
 chrome.storage.sync.get(DEFAULTS, (stored) => {
-  enabledEl.checked = stored.enabled;
-  strengthEl.value = stored.strength;
-  strengthValueEl.textContent = stored.strength;
-  denoiseEl.checked = stored.denoise;
-  splitPreviewEl.checked = stored.splitPreview;
+  for (const id of CHECKBOXES) el(id).checked = stored[id];
+  for (const id of SLIDERS) {
+    el(id).value = stored[id];
+    el(`${id}Value`).textContent = stored[id];
+  }
+  el("upscale").value = stored.upscale;
+  syncEnabledState(stored.enabled);
 });
 
-enabledEl.addEventListener("change", () => {
-  chrome.storage.sync.set({ enabled: enabledEl.checked });
-});
+for (const id of CHECKBOXES) {
+  el(id).addEventListener("change", () => {
+    const checked = el(id).checked;
+    chrome.storage.sync.set({ [id]: checked });
+    if (id === "enabled") syncEnabledState(checked);
+  });
+}
 
-strengthEl.addEventListener("input", () => {
-  const value = Number(strengthEl.value);
-  strengthValueEl.textContent = value;
-  chrome.storage.sync.set({ strength: value });
-});
+for (const id of SLIDERS) {
+  el(id).addEventListener("input", () => {
+    const value = Number(el(id).value);
+    el(`${id}Value`).textContent = value;
+    chrome.storage.sync.set({ [id]: value });
+  });
+}
 
-denoiseEl.addEventListener("change", () => {
-  chrome.storage.sync.set({ denoise: denoiseEl.checked });
-});
-
-splitPreviewEl.addEventListener("change", () => {
-  chrome.storage.sync.set({ splitPreview: splitPreviewEl.checked });
+el("upscale").addEventListener("change", () => {
+  chrome.storage.sync.set({ upscale: el("upscale").value });
 });

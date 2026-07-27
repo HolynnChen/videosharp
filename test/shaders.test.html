@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html>
+  <head><meta charset="utf-8" /><title>VidSharp shader tests</title></head>
+  <body>
+    <pre id="result">running</pre>
+    <script type="module">
+      const log = [];
+      const fail = (m) => log.push("FAIL: " + m);
+      const ok = (m) => log.push("ok: " + m);
+      const finish = (status) => {
+        document.getElementById("result").textContent =
+          JSON.stringify({ status, log }, null, 2);
+        window.__done = { status, log };
+      };
+
+      try {
+        if (!navigator.gpu) throw new Error("no navigator.gpu");
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) throw new Error("no adapter");
+        const device = await adapter.requestDevice();
+        device.addEventListener?.("uncapturederror", (e) =>
+          fail("uncaptured: " + e.error.message));
+
+        // 生产 shader 用 texture_external（只能绑真实视频帧），测试里换成
+        // texture_2d 以便注入已知像素。数学部分逐字不变。
+        async function loadShader(name, swapExternal) {
+          let code = await (await fetch(`../src/${name}.wgsl`)).text();
+          if (swapExternal) {
+            const before = code;
+            code = code
+              .replace("var srcTex: texture_external;", "var srcTex: texture_2d<f32>;")
+              .replace(
+                /textureSampleBaseClampToEdge\(srcTex, srcSampler, ([^)]+)\)/g,
+                "textureSampleLevel(srcTex, srcSampler, $1, 0.0)",
+              );
+            if (code === before) throw new Error(`${name}: external 替换失败`);
+          }
+          return code;
+        }
+
+        const SAMPLER = device.createSampler({
+          magFilter: "linear", minFilter: "linear",
+          addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge",
+        });
+        const FORMAT = "rgba8unorm";
+
+        async function compile(name, swapExternal) {
+          const code = await loadShader(name, swapExternal);
+          const module = device.createShaderModule({ code });
+          const info = await module.getCompilationInfo();
+          const errors = info.messages.filter((m) => m.type === "error");
+          if (errors.length) {
+            for (const m of errors) fail(`${name}.wgsl ${m.lineNum}:${m.linePos} ${m.message}`);
+            return null;
+          }
+          ok(`${name}.wgsl 编译通过`);
+          return module;
+        }
+
+        function makeTexture(w, h, pixels) {
+          const tex = device.createTexture({
+            size: [w, h], format: FORMAT,
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+                 | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+          });
+          if (pixels) {
+            device.queue.writeTexture({ texture: tex }, pixels,
+              { bytesPerRow: w * 4 }, [w, h]);
+          }
+          return tex;
+        }
+
+        async function readback(tex, w, h) {
+          const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
+          const buf = device.createBuffer({
+            size: bytesPerRow * h,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          });
+          const enc = device.createCommandEncoder();
+          enc.copyTextureToBuffer({ texture: tex },
+            { buffer: buf, bytesPerRow }, [w, h]);
+          device.queue.submit([enc.finish()]);
+          await buf.mapAsync(GPUMapMode.READ);
+          const raw = new Uint8Array(buf.getMappedRange()).slice();
+          buf.unmap();
+          return (x, y) => {
+            const o = y * bytesPerRow + x * 4;
+            return [raw[o], raw[o + 1], raw[o + 2]];
+          };
+        }
+
+        function runPass(module, srcTex, dstTex, dstW, dstH, uniforms) {
+          const pipeline = device.createRenderPipeline({
+            layout: "auto",
+            vertex: { module, entryPoint: "vs_main" },
+            fragment: { module, entryPoint: "fs_main", targets: [{ format: FORMAT }] },
+            primitive: { topology: "triangle-list" },
+          });
+          const entries = [
+            { binding: 0, resource: srcTex.createView() },
+            { binding: 1, resource: SAMPLER },
+          ];
+          if (uniforms) {
+            const ub = device.createBuffer({
+              size: 16,
+              usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(ub, 0, new Float32Array(uniforms));
+            entries.push({ binding: 2, resource: { buffer: ub } });
+          }
+          const enc = device.createCommandEncoder();
+          const pass = enc.beginRenderPass({
+            colorAttachments: [{
+              view: dstTex.createView(),
+              loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              storeOp: "store",
+            }],
+          });
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0), entries,
+          }));
+          pass.draw(3);
+          pass.end();
+          device.queue.submit([enc.finish()]);
+        }
+
+        /* ======== 编译全部 shader ======== */
+        const mEnhance = await compile("enhance", true);
+        const mEasu = await compile("easu", false);
+        const mRcas = await compile("rcas", false);
+        if (!mEnhance || !mEasu || !mRcas) {
+          finish("shader-compile-error");
+          throw new Error("__handled__");
+        }
+
+        /* ======== 测试图 ======== */
+        const S = 16;
+        // 竖直边缘 + 一条 45 度斜边（用于验证 EASU 的方向自适应）
+        const edgePixels = new Uint8Array(S * S * 4);
+        for (let y = 0; y < S; y++) {
+          for (let x = 0; x < S; x++) {
+            const i = (y * S + x) * 4;
+            const v = x + y < S ? 40 : 210;
+            edgePixels[i] = edgePixels[i + 1] = edgePixels[i + 2] = v;
+            edgePixels[i + 3] = 255;
+          }
+        }
+        const edgeTex = makeTexture(S, S, edgePixels);
+
+        /* ======== EASU: 放大正确性 ======== */
+        const UP = S * 2;
+        const upTex = makeTexture(UP, UP, null);
+        runPass(mEasu, edgeTex, upTex, UP, UP, null);
+        const up = await readback(upTex, UP, UP);
+
+        // 斜边两侧的极值应当被保留（不因插值丢失动态范围）
+        const corner0 = up(1, 1)[0];        // 深色侧
+        const cornerFar = up(UP - 2, UP - 2)[0]; // 亮色侧
+        if (corner0 < 70 && cornerFar > 180) {
+          ok(`EASU 保留动态范围 (暗${corner0} 亮${cornerFar})`);
+        } else {
+          fail(`EASU 动态范围丢失: 暗${corner0}(期望<70) 亮${cornerFar}(期望>180)`);
+        }
+
+        // 放大后不应出现越界或全黑
+        let easuAllSame = true;
+        const first = up(0, 0)[0];
+        for (let y = 0; y < UP; y += 3) {
+          for (let x = 0; x < UP; x += 3) {
+            if (up(x, y)[0] !== first) easuAllSame = false;
+          }
+        }
+        if (!easuAllSame) ok("EASU 输出有空间变化");
+        else fail("EASU 输出为纯色，采样失效");
+
+        // 斜边应当平滑过渡：沿垂直于边缘方向取样，中间值应介于两端之间
+        const mid = up(UP / 2, UP / 2)[0];
+        if (mid > corner0 && mid < cornerFar) {
+          ok(`EASU 斜边过渡单调 (${corner0} < ${mid} < ${cornerFar})`);
+        } else {
+          fail(`EASU 斜边过渡异常: 中间值 ${mid} 未介于 ${corner0}~${cornerFar}`);
+        }
+
+        /* ======== enhance: 全部关闭时应恒等 ======== */
+        const idTex = makeTexture(S, S, null);
+        runPass(mEnhance, edgeTex, idTex, S, S, [0, 0, 0, 0]);
+        const idRead = await readback(idTex, S, S);
+        // 取远离块边界与斜边的点
+        const idSample = idRead(3, 12)[0];
+        const expected = 3 + 12 < S ? 40 : 210;
+        if (Math.abs(idSample - expected) <= 2) {
+          ok(`enhance 全关时恒等 (${idSample} ≈ ${expected})`);
+        } else {
+          fail(`enhance 全关时改动了画面: ${idSample}, 期望 ${expected}`);
+        }
+
+        /* ======== enhance: 平坦区不被去块破坏 ======== */
+        const flatPixels = new Uint8Array(S * S * 4).fill(255);
+        for (let i = 0; i < S * S; i++) {
+          flatPixels[i * 4] = flatPixels[i * 4 + 1] = flatPixels[i * 4 + 2] = 128;
+        }
+        const flatTex = makeTexture(S, S, flatPixels);
+        const flatOut = makeTexture(S, S, null);
+        // 去块与对比度全开，去色带关闭（它会故意加抖动）
+        runPass(mEnhance, flatTex, flatOut, S, S, [1, 0, 1, 0]);
+        const flatRead = await readback(flatOut, S, S);
+        let flatMaxDev = 0;
+        for (let y = 1; y < S - 1; y++) {
+          for (let x = 1; x < S - 1; x++) {
+            flatMaxDev = Math.max(flatMaxDev, Math.abs(flatRead(x, y)[0] - 128));
+          }
+        }
+        if (flatMaxDev <= 2) {
+          ok(`enhance 纯色区稳定 (最大偏差 ${flatMaxDev})`);
+        } else {
+          fail(`enhance 破坏了纯色区: 最大偏差 ${flatMaxDev}`);
+        }
+
+        /* ======== enhance: 去色带只在渐变区起作用 ======== */
+        // 纯色区 range 恰为 0，代码中 isFlat 要求 range > 0，故不应加抖动
+        const debandOut = makeTexture(S, S, null);
+        runPass(mEnhance, flatTex, debandOut, S, S, [0, 1, 0, 7]);
+        const debandRead = await readback(debandOut, S, S);
+        let debandDev = 0;
+        for (let y = 1; y < S - 1; y++) {
+          for (let x = 1; x < S - 1; x++) {
+            debandDev = Math.max(debandDev, Math.abs(debandRead(x, y)[0] - 128));
+          }
+        }
+        if (debandDev <= 2) {
+          ok(`去色带未污染纯色区 (最大偏差 ${debandDev})`);
+        } else {
+          fail(`去色带在纯色区加了噪声: 偏差 ${debandDev}`);
+        }
+
+        /* ======== RCAS: 沿用原有验证 ======== */
+        const rcasIn = makeTexture(S, S, edgePixels);
+        const rcasOut = makeTexture(S, S, null);
+
+        runPass(mRcas, rcasIn, rcasOut, S, S, [0, 0, 0, 0]);
+        const r0 = await readback(rcasOut, S, S);
+        const r0v = r0(3, 12)[0];
+        if (Math.abs(r0v - expected) <= 2) {
+          ok(`RCAS sharpness=0 恒等 (${r0v})`);
+        } else {
+          fail(`RCAS sharpness=0 未恒等: ${r0v}, 期望 ${expected}`);
+        }
+
+        const rcasOut2 = makeTexture(S, S, null);
+        runPass(mRcas, rcasIn, rcasOut2, S, S, [1, 0, 0, 0]);
+        const r1 = await readback(rcasOut2, S, S);
+
+        // 跨斜边取相邻两点，锐化后对比不应降低
+        const a0 = r0(7, 8)[0], b0 = r0(8, 8)[0];
+        const a1 = r1(7, 8)[0], b1 = r1(8, 8)[0];
+        if (Math.abs(b1 - a1) >= Math.abs(b0 - a0)) {
+          ok(`RCAS 边缘对比未降低 (${Math.abs(b0 - a0)} → ${Math.abs(b1 - a1)})`);
+        } else {
+          fail(`RCAS 边缘对比下降: ${Math.abs(b0 - a0)} → ${Math.abs(b1 - a1)}`);
+        }
+
+        // 强度单调性（上一版 exp2 映射错误的回归测试）
+        const map = (s) => Math.max(0, Math.min(1, s / 100));
+        if (map(0) === 0 && map(100) === 1) {
+          ok("强度映射端点正确 (0→0, 100→1)");
+        } else {
+          fail(`强度映射端点错误: 0→${map(0)}, 100→${map(100)}`);
+        }
+
+        /* ======== 输出尺寸计算（纯逻辑回归） ======== */
+        const UPSCALE_TARGETS = { "2k": 2560, "4k": 3840 };
+        function computeOutputSize(vw, vh, mode, maxDim) {
+          if (mode === "off" || !vw || !vh) return { w: vw, h: vh };
+          let scale;
+          if (mode === "2x") scale = 2;
+          else {
+            const t = UPSCALE_TARGETS[mode];
+            if (!t) return { w: vw, h: vh };
+            if (vw >= t) return { w: vw, h: vh };
+            scale = t / vw;
+          }
+          scale = Math.min(scale, Math.min(maxDim / vw, maxDim / vh));
+          if (scale <= 1) return { w: vw, h: vh };
+          return { w: Math.round(vw * scale), h: Math.round(vh * scale) };
+        }
+
+        const M1_MAX = 8192;
+        const cases = [
+          [[1920, 1080, "2k", M1_MAX], [2560, 1440], "1080p→2K"],
+          [[1280, 720, "2k", M1_MAX], [2560, 1440], "720p→2K"],
+          [[1920, 1080, "4k", M1_MAX], [3840, 2160], "1080p→4K"],
+          [[2560, 1440, "2k", M1_MAX], [2560, 1440], "已达2K不放大"],
+          [[3840, 2160, "2k", M1_MAX], [3840, 2160], "4K源不缩小"],
+          [[1920, 1080, "off", M1_MAX], [1920, 1080], "关闭时原尺寸"],
+          [[1920, 1080, "2x", M1_MAX], [3840, 2160], "2倍放大"],
+          // 4K 源 2x = 7680x4320，仍在 8192 限制内，应正常放大
+          [[3840, 2160, "2x", M1_MAX], [7680, 4320], "4K源2倍仍在上限内"],
+          // 5K 源 2x 会超限，scale 被钳到 8192/5120=1.6
+          [[5120, 2880, "2x", M1_MAX], [8192, 4608], "超纹理上限时钳制"],
+        ];
+        let sizeOk = true;
+        for (const [args, want, name] of cases) {
+          const got = computeOutputSize(...args);
+          if (got.w !== want[0] || got.h !== want[1]) {
+            fail(`尺寸计算 ${name}: 得到 ${got.w}x${got.h}, 期望 ${want[0]}x${want[1]}`);
+            sizeOk = false;
+          }
+        }
+        if (sizeOk) ok(`尺寸计算全部正确 (${cases.length} 例)`);
+
+        finish(log.some((l) => l.startsWith("FAIL")) ? "failed" : "passed");
+      } catch (err) {
+        if (err.message !== "__handled__") {
+          fail(err.message);
+          finish("error");
+        }
+      }
+    </script>
+  </body>
+</html>

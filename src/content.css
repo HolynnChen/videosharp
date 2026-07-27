@@ -1,8 +1,8 @@
-/* 覆盖层：完全贴合 video 元素，处理成功后才淡入，避免闪黑
+/* 覆盖层：贴合 video，处理成功后才淡入
  *
- * z-index 取一个足够高的值：B 站等站点的弹幕层、控制条会盖住低层级元素，
- * 导致 canvas 在渲染但用户看到的仍是原视频。这里压过播放器内部层级，
- * 但保持 pointer-events: none，控制条依然可点。 */
+ * z-index 刻意取 1（而非顶到最大）：只需压过 video 本身，让弹幕层、
+ * 字幕、控制条这些后续兄弟节点或更高层容器保持在上方。
+ * 上一版设成 2147483000 导致播放器 UI 全被盖住，是错误的做法。 */
 .vidsharp-overlay {
   position: absolute;
   inset: 0;
@@ -10,7 +10,7 @@
   height: 100%;
   object-fit: inherit;
   pointer-events: none;
-  z-index: 2147483000;
+  z-index: 1;
   opacity: 0;
   transition: opacity 160ms ease-out;
 }
@@ -19,9 +19,43 @@
   opacity: 1;
 }
 
-/* 诊断模式：留出右半边显示原视频，便于左右对比 */
-.vidsharp-overlay.vidsharp-split {
-  clip-path: inset(0 50% 0 0);
+/* 拖动对比分割条 —— 需要接收指针事件，所以比覆盖层高一级 */
+.vidsharp-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 40px;
+  margin-left: -20px;
+  z-index: 2;
+  cursor: ew-resize;
+  touch-action: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.vidsharp-divider-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  margin-left: -1px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 0 6px rgba(0, 0, 0, 0.6);
+}
+
+.vidsharp-divider-handle {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.95);
+  color: #222;
+  font: 15px/34px system-ui, sans-serif;
+  text-align: center;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  user-select: none;
 }
 
 .vidsharp-toast {

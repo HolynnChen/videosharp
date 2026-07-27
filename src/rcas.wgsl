@@ -26,7 +26,9 @@ struct Params {
     _pad1: f32,
 };
 
-@group(0) @binding(0) var srcTex: texture_external;
+// 输入是 EASU pass 的输出纹理（已放大到目标分辨率）。
+// 锐化必须在放大之后做 —— 放大前锐化会被插值重新糊掉。
+@group(0) @binding(0) var srcTex: texture_2d<f32>;
 @group(0) @binding(1) var srcSampler: sampler;
 @group(0) @binding(2) var<uniform> params: Params;
 
@@ -48,7 +50,7 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOut {
 }
 
 fn tap(uv: vec2<f32>) -> vec3<f32> {
-    return textureSampleBaseClampToEdge(srcTex, srcSampler, uv).rgb;
+    return textureSampleLevel(srcTex, srcSampler, uv, 0.0).rgb;
 }
 
 // 近似亮度（FSR 原式：B*0.5 + (R*0.5 + G)，相当于 2x 亮度，比例关系足够）
