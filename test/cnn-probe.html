@@ -86,6 +86,9 @@
           name: "realesr-general-x4v3",
           file: "../models/realesr-general.onnx",
           tile: 128, ch: 3, scale: 4,
+          // 单块约 250ms 且中间张量大，诊断时需减少迭代与 batch 上限，
+          // 否则反复创建 session 会撑爆 WASM 堆
+          heavy: true,
         },
       ];
 
@@ -176,6 +179,22 @@
         return feeds;
       }
 
+      /* session.release() 返回 Promise —— 不 await 的话 WASM 堆还没回收就
+       * 又创建下一个 session，反复几轮后会 "memory access out of bounds"。
+       * 早期版本的 realesr 诊断就是这样崩的。 */
+      async function dispose(...sessions) {
+        for (const s of sessions) {
+          if (!s) continue;
+          try {
+            await s.release?.();
+          } catch (err) {
+            log(`  (释放 session 失败: ${err.message.slice(0, 60)})`);
+          }
+        }
+        // 让出一轮事件循环，给 ORT 的内部清理留出时机
+        await new Promise((r) => setTimeout(r, 0));
+      }
+
       async function timeRuns(session, feeds, n) {
         const times = [];
         for (let i = 0; i < n; i++) {
@@ -211,7 +230,7 @@
         } catch (err) {
           if (err instanceof Aborted) throw err;
           log(`  ✗ 推理失败: ${err.message}`);
-          session.release?.();
+          await dispose(session);
           return { model, ep, error: err.message };
         }
         log(`  warmup: ${(performance.now() - tw).toFixed(0)}ms`);
@@ -223,7 +242,7 @@
         log(`  1080p: ${tiles} 块 × ${median.toFixed(2)}ms = ${frameMs.toFixed(0)}ms → ${(1000/frameMs).toFixed(1)} fps`);
         log(`  距 60fps: 需再快 ${(frameMs / BUDGET_60).toFixed(0)}×`);
 
-        session.release?.();
+        await dispose(session);
         return { model, ep, median, tiles, frameMs };
       }
 
@@ -235,17 +254,22 @@
         const o = await loadOrt();
         log(`\n── 回退诊断: ${model.name} ──`);
         const out = {};
+        // 重型模型少测几次：每次 session 创建都要重新分配 WASM 堆，
+        // 250ms/次的模型跑 6 轮 × 2 EP 很容易把堆撑爆
+        const iters = model.heavy ? 2 : 6;
         for (const ep of ["webgpu", "wasm"]) {
+          let s = null;
           try {
-            const s = await makeSession(o, model.file, ep);
+            s = await makeSession(o, model.file, ep);
             const f = makeFeed(o, s, model, 1);
             await s.run(f);
-            const { median } = await timeRuns(s, f, 6);
+            const { median } = await timeRuns(s, f, iters);
             out[ep] = median;
-            s.release?.();
           } catch (err) {
             if (err instanceof Aborted) throw err;
             log(`  ${ep} 失败: ${err.message}`);
+          } finally {
+            await dispose(s);
           }
         }
         if (out.webgpu && out.wasm) {
@@ -282,7 +306,10 @@
 
         const tiles = Math.ceil(1920 / model.tile) * Math.ceil(1080 / model.tile);
         const results = [];
-        for (const batch of [1, 4, 8, 16]) {
+        // 重型模型只测到 batch=4：batch=16 × 250ms 会分配巨大的中间张量，
+        // 实测会把 WASM 堆撑爆（memory access out of bounds）
+        const batches = model.heavy ? [1, 2, 4] : [1, 4, 8, 16];
+        for (const batch of batches) {
           if (batch > tiles) break;
           try {
             const feeds = makeFeed(o, session, model, batch);
@@ -307,7 +334,7 @@
             break;
           }
         }
-        session.release?.();
+        await dispose(session);
 
         if (results.length > 1) {
           const gain = results[0].perTile / results[results.length - 1].perTile;
@@ -340,7 +367,7 @@
           const f0 = makeFeed(o, s0, model, 1);
           await s0.run(f0);
           unitMs = (await timeRuns(s0, f0, 3)).median;
-          s0.release?.();
+          await dispose(s0);
           log(`  基准单次: ${unitMs.toFixed(2)}ms`);
         } catch (err) {
           log(`  ✗ ${err.message}`);
@@ -389,9 +416,7 @@
             if (err instanceof Aborted) throw err;
             log(`  ${par} 路并发: 失败/超时 — ${err.message.slice(0, 100)}`);
           } finally {
-            for (const s of sessions) {
-              try { s.release?.(); } catch { /* 忽略释放失败 */ }
-            }
+            await dispose(...sessions);
           }
         }
       }
