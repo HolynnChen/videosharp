@@ -64,6 +64,7 @@
     <button id="run">基础测试 (WebGPU)</button>
     <button id="runFull">完整诊断 (含批处理/回退检测)</button>
     <button id="runWasm">加测 WASM 对照</button>
+    <button id="abort" disabled>中止</button>
 
     <div id="verdict"></div>
     <pre id="log">等待开始…</pre>
@@ -99,6 +100,11 @@
         el.className = "verdict " + cls;
         el.textContent = text;
       };
+
+      // 中止标志。诊断项之间检查，避免长流程无法中断。
+      let aborted = false;
+      class Aborted extends Error {}
+      const checkAbort = () => { if (aborted) throw new Aborted("已中止"); };
 
       /* ---- 环境 ---- */
       let adapter = null;
@@ -173,6 +179,7 @@
       async function timeRuns(session, feeds, n) {
         const times = [];
         for (let i = 0; i < n; i++) {
+          checkAbort();
           const t = performance.now();
           await session.run(feeds);
           times.push(performance.now() - t);
@@ -192,6 +199,7 @@
           session = await makeSession(o, model.file, ep);
           log(`  加载: ${(performance.now() - t).toFixed(0)}ms`);
         } catch (err) {
+          if (err instanceof Aborted) throw err;
           log(`  ✗ 加载失败: ${err.message}`);
           return { model, ep, error: err.message };
         }
@@ -201,6 +209,7 @@
         try {
           await session.run(feeds);
         } catch (err) {
+          if (err instanceof Aborted) throw err;
           log(`  ✗ 推理失败: ${err.message}`);
           session.release?.();
           return { model, ep, error: err.message };
@@ -235,6 +244,7 @@
             out[ep] = median;
             s.release?.();
           } catch (err) {
+            if (err instanceof Aborted) throw err;
             log(`  ${ep} 失败: ${err.message}`);
           }
         }
@@ -277,14 +287,22 @@
           try {
             const feeds = makeFeed(o, session, model, batch);
             await session.run(feeds);       // warmup 该 shape
-            const { median } = await timeRuns(session, feeds, 5);
+            // 大 batch 迭代次数减少，避免慢模型把页面挂住太久
+            const iters = batch >= 8 ? 3 : 5;
+            const { median } = await timeRuns(session, feeds, iters);
             const perTile = median / batch;
             const frameMs = perTile * tiles;
             log(`  batch=${String(batch).padStart(2)}: ${median.toFixed(2)}ms 总 · ` +
                 `${perTile.toFixed(2)}ms/块 · 1080p ≈ ${frameMs.toFixed(0)}ms → ` +
                 `${(1000/frameMs).toFixed(1)} fps`);
             results.push({ batch, perTile, frameMs });
+            // 单次已达数秒时继续加倍 batch 只会更久，结论也不会变
+            if (median > 4000) {
+              log(`  停止加大 batch —— 单次已超 4s。`);
+              break;
+            }
           } catch (err) {
+            if (err instanceof Aborted) throw err;
             log(`  batch=${batch}: 不支持 — ${err.message.slice(0, 120)}`);
             break;
           }
@@ -305,31 +323,77 @@
       }
 
       /* ---- 诊断 3: 并行提交 ----
-       * 不逐块 await，而是同时发起多个 run 让 ORT/驱动自行流水。
-       * 这能揭示"串行等待"占了多少时间。 */
+       * 目的：串行逐块 await 会在每块之间插入完整的 JS→GPU→JS 往返，
+       * 这里测多路并发能否让 GPU 流水起来。
+       *
+       * 关键：必须为每路并发建独立 session。同一个 session 并发调用 run()
+       * 不是线程安全的 —— 实测会直接死锁（早期版本卡在这一步）。
+       */
       async function diagConcurrent(model) {
         const o = await loadOrt();
         log(`\n── 并行提交诊断: ${model.name} ──`);
-        let session;
+
+        // 单次耗时用来推算超时上限，避免再次卡死整个页面
+        let unitMs = 0;
         try {
-          session = await makeSession(o, model.file, "webgpu");
+          const s0 = await makeSession(o, model.file, "webgpu");
+          const f0 = makeFeed(o, s0, model, 1);
+          await s0.run(f0);
+          unitMs = (await timeRuns(s0, f0, 3)).median;
+          s0.release?.();
+          log(`  基准单次: ${unitMs.toFixed(2)}ms`);
         } catch (err) {
           log(`  ✗ ${err.message}`);
           return null;
         }
-        const feeds = makeFeed(o, session, model, 1);
-        await session.run(feeds);
 
-        for (const par of [1, 4, 8]) {
-          const t = performance.now();
-          // 注意：同一 session 并发 run 在 ORT 中会被串行化，这里测的是
-          // 去掉 JS 层 await 往返后的净收益
-          await Promise.all(Array.from({ length: par }, () => session.run(feeds)));
-          const total = performance.now() - t;
-          log(`  并行 ${String(par).padStart(2)} 次: 总 ${total.toFixed(2)}ms · ` +
-              `${(total / par).toFixed(2)}ms/次`);
+        // 单次已经很慢的模型不值得再测并发：多开 session 会成倍拉长等待，
+        // 且结论不会改变（250ms/块 × 135 块无论怎么并发都无救）。
+        if (unitMs > 80) {
+          log(`  跳过并发测试 —— 单次 ${unitMs.toFixed(0)}ms 过慢，并发无法改变结论。`);
+          return null;
         }
-        session.release?.();
+
+        for (const par of [2, 4]) {
+          // 每路独立 session，避免共享 session 并发死锁
+          let sessions = [];
+          try {
+            for (let i = 0; i < par; i++) {
+              sessions.push(await makeSession(o, model.file, "webgpu"));
+            }
+            const feedsList = sessions.map((s) => makeFeed(o, s, model, 1));
+            // 各 session 分别预热，把 shader 编译排除在计时之外
+            await Promise.all(sessions.map((s, i) => s.run(feedsList[i])));
+
+            // 超时保护：并发不该比串行慢太多，超了就判定为异常并跳过
+            const budget = Math.max(3000, unitMs * par * 6);
+            const t = performance.now();
+            const work = Promise.all(
+              sessions.map((s, i) => s.run(feedsList[i])),
+            );
+            const timeout = new Promise((_, rej) =>
+              setTimeout(() => rej(new Error(`超过 ${budget.toFixed(0)}ms 未完成`)), budget),
+            );
+            await Promise.race([work, timeout]);
+            const total = performance.now() - t;
+
+            const serialEquiv = unitMs * par;
+            const gain = serialEquiv / total;
+            log(`  ${par} 路并发: 总 ${total.toFixed(2)}ms · ` +
+                `${(total / par).toFixed(2)}ms/次 · ` +
+                `相对串行 ${serialEquiv.toFixed(0)}ms 增益 ${gain.toFixed(2)}×`);
+            if (gain < 1.2) {
+              log(`    ⚠ 增益很小 —— GPU 已被单路占满，瓶颈是算力不是调度。`);
+            }
+          } catch (err) {
+            if (err instanceof Aborted) throw err;
+            log(`  ${par} 路并发: 失败/超时 — ${err.message.slice(0, 100)}`);
+          } finally {
+            for (const s of sessions) {
+              try { s.release?.(); } catch { /* 忽略释放失败 */ }
+            }
+          }
+        }
       }
 
       /* ---- 诊断 4: 与纯 shader 对比 ----
@@ -434,39 +498,64 @@
       }
 
       async function run(mode) {
-        const btns = [...document.querySelectorAll("button")];
+        const btns = [...document.querySelectorAll("button")]
+          .filter((b) => b.id !== "abort");
+        const abortBtn = document.getElementById("abort");
         btns.forEach((b) => (b.disabled = true));
+        abortBtn.disabled = false;
+        aborted = false;
         lines.length = 0;
         log(`开始 — ${new Date().toLocaleTimeString()}  模式: ${mode}`);
 
-        if (await checkModels()) {
-          const results = [];
-          const eps = mode === "wasm" ? ["webgpu", "wasm"] : ["webgpu"];
-          for (const ep of eps) {
-            for (const model of MODELS) results.push(await basic(model, ep));
-          }
-          judge(results);
-
-          if (mode === "full") {
-            log(`\n${"═".repeat(56)}`);
-            log(`GPU 利用率诊断`);
-            log("═".repeat(56));
-            for (const model of MODELS) {
-              await diagFallback(model);
-              await diagBatch(model);
-              await diagConcurrent(model);
+        try {
+          if (await checkModels()) {
+            const results = [];
+            const eps = mode === "wasm" ? ["webgpu", "wasm"] : ["webgpu"];
+            for (const ep of eps) {
+              for (const model of MODELS) {
+                checkAbort();
+                results.push(await basic(model, ep));
+              }
             }
-            await diagShaderBaseline();
-          }
-        }
+            judge(results);
 
-        log(`\n完成。`);
-        btns.forEach((b) => (b.disabled = false));
+            if (mode === "full") {
+              log(`\n${"═".repeat(56)}`);
+              log(`GPU 利用率诊断`);
+              log("═".repeat(56));
+              for (const model of MODELS) {
+                checkAbort();
+                await diagFallback(model);
+                checkAbort();
+                await diagBatch(model);
+                checkAbort();
+                await diagConcurrent(model);
+              }
+              checkAbort();
+              await diagShaderBaseline();
+            }
+          }
+          log(`\n完成。`);
+        } catch (err) {
+          if (err instanceof Aborted) {
+            log(`\n已中止。上面的结果仍然有效。`);
+          } else {
+            log(`\n✗ 出错: ${err.message}`);
+            log(err.stack || "");
+          }
+        } finally {
+          btns.forEach((b) => (b.disabled = false));
+          abortBtn.disabled = true;
+        }
       }
 
       document.getElementById("run").addEventListener("click", () => run("basic"));
       document.getElementById("runFull").addEventListener("click", () => run("full"));
       document.getElementById("runWasm").addEventListener("click", () => run("wasm"));
+      document.getElementById("abort").addEventListener("click", () => {
+        aborted = true;
+        log(`\n中止请求已发出，等待当前推理返回…`);
+      });
     </script>
   </body>
 </html>
