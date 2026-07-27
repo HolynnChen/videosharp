@@ -1,0 +1,14 @@
+{
+  "name": "vidsharp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WebGPU RCAS adaptive sharpening for web video",
+  "scripts": {
+    "test": "node test/run.js"
+  },
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "playwright-core": "^1.62.0"
+  }
+}
