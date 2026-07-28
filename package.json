@@ -4,10 +4,11 @@
   "private": true,
   "description": "WebGPU video enhancement: EASU upscaling + deblock/deband + RCAS sharpening",
   "scripts": {
-    "test": "node test/check-manifest.js && node test/run.js",
+    "test": "node test/check-manifest.js && node test/run-decode.js && node test/run.js",
     "fetch-models": "node test/fetch-models.js",
     "probe": "node test/serve-probe.js",
-    "check": "node test/check-manifest.js"
+    "check": "node test/check-manifest.js",
+    "test:decode": "node test/run-decode.js"
   },
   "license": "MIT",
   "type": "commonjs",

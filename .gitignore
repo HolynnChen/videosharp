@@ -1,3 +1,6 @@
 node_modules/
 models/*.onnx
 !models/xlsr-dynamic.onnx
+# H.264 测试数据不入库（多数 CI 的 Chromium 无 H.264，用不上）
+test/init.mp4
+test/seg*.m4s

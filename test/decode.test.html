@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head><meta charset="utf-8" /><title>decode test</title></head>
+  <body>
+    <pre id="result">running</pre>
+    <script type="module">
+      /* 端到端验证 fMP4 解析 → VideoDecoder 解码链路。
+       *
+       * 用真实分片（ffmpeg 生成的 H.264 fMP4，结构与 B 站一致：
+       * ftyp+moov 作 init 段，moof+mdat 作媒体段）。
+       *
+       * 这一步必须实测：mp4box 的 API、DataStream 字节序、description
+       * 提取方式、fileStart 连续性要求 —— 任何一处写错都只在运行时暴露。
+       */
+      const log = [];
+      const fail = (m) => log.push("FAIL: " + m);
+      const ok = (m) => log.push("ok: " + m);
+      const finish = (status) => {
+        document.getElementById("result").textContent =
+          JSON.stringify({ status, log }, null, 2);
+        window.__done = { status, log };
+      };
+
+      try {
+        if (typeof VideoDecoder === "undefined") {
+          throw new Error("此环境无 WebCodecs");
+        }
+
+        const MP4Box = await import("/vendor/mp4box/mp4box.all.mjs");
+        ok("mp4box 加载成功");
+        for (const k of ["createFile", "DataStream", "Endianness"]) {
+          if (!MP4Box[k]) fail(`mp4box 缺少导出 ${k}`);
+        }
+        if (!log.some((l) => l.startsWith("FAIL"))) {
+          ok("createFile / DataStream / Endianness 均存在");
+        }
+
+        /* 选一套本环境能解码的测试数据。
+         * Playwright 的 Chromium 不含 H.264（专有编解码器需授权），
+         * 但支持 VP9/AV1；真实 Chrome 两者都支持。所以准备两套数据，
+         * 挑能解的那套 —— 验证的是解析与解码链路，与具体 codec 无关。 */
+        const H264_OK = (await VideoDecoder.isConfigSupported({
+          codec: "avc1.64001e", codedWidth: 640, codedHeight: 360,
+        }).catch(() => ({ supported: false }))).supported;
+        const prefix = H264_OK ? "" : "vp9-";
+        ok(`测试用 ${H264_OK ? "H.264" : "VP9"} 数据` +
+           (H264_OK ? "" : "（本环境无 H.264，属预期）"));
+
+        const initBuf = await (await fetch(`/test/${prefix}init.mp4`)).arrayBuffer();
+        const segs = [];
+        for (const n of [0, 1]) {
+          segs.push(
+            await (await fetch(`/test/${prefix}seg${n}.m4s`)).arrayBuffer(),
+          );
+        }
+        ok(`测试数据: init ${initBuf.byteLength}B + ${segs.length} 个媒体段`);
+
+        // --- 复刻 decode.js 的核心逻辑 ---
+        const file = MP4Box.createFile();
+        let trackInfo = null;
+        let description = null;
+        let readyErr = null;
+
+        file.onError = (e) => { readyErr = new Error("mp4box: " + e); };
+
+        file.onReady = (info) => {
+          try {
+            const t = info.videoTracks?.[0];
+            if (!t) throw new Error("没有视频轨");
+            trackInfo = t;
+            const trak = file.getTrackById(t.id);
+            for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+              const box = entry.avcC ?? entry.hvcC ?? entry.vpcC ?? entry.av1C;
+              if (!box) continue;
+              const stream = new MP4Box.DataStream(
+                undefined, 0, MP4Box.Endianness.BIG_ENDIAN,
+              );
+              box.write(stream);
+              description = new Uint8Array(stream.buffer, 8);
+              break;
+            }
+          } catch (e) { readyErr = e; }
+        };
+
+        let offset = 0;
+        const push = (buf) => {
+          buf.fileStart = offset;
+          offset += buf.byteLength;
+          file.appendBuffer(buf);
+        };
+
+        push(initBuf);
+        if (readyErr) throw readyErr;
+        if (!trackInfo) {
+          fail("onReady 未触发 —— init 段解析失败");
+          finish("failed");
+          throw new Error("__handled__");
+        }
+        ok(`解析出视频轨: ${trackInfo.codec} ` +
+           `${trackInfo.track_width}×${trackInfo.track_height}`);
+
+        if (!description) {
+          fail("未能提取 description（avcC）—— VideoDecoder 无法配置");
+          finish("failed");
+          throw new Error("__handled__");
+        }
+        ok(`提取 description 成功: ${description.byteLength}B ` +
+           `(前4字节 ${Array.from(description.slice(0, 4)).join(",")})`);
+
+        // --- 配置解码器并解码 ---
+        const frames = [];
+        const decoder = new VideoDecoder({
+          output: (f) => {
+            frames.push({
+              ts: f.timestamp,
+              w: f.displayWidth,
+              h: f.displayHeight,
+              fmt: f.format,
+            });
+            f.close();   // 必须 close，否则解码器 stall
+          },
+          error: (e) => fail("解码器错误: " + e.message),
+        });
+
+        const support = await VideoDecoder.isConfigSupported({
+          codec: trackInfo.codec,
+          codedWidth: trackInfo.track_width,
+          codedHeight: trackInfo.track_height,
+          description,
+        });
+        if (!support.supported) {
+          fail(`codec ${trackInfo.codec} 不被支持`);
+          finish("failed");
+          throw new Error("__handled__");
+        }
+        ok(`codec ${trackInfo.codec} 受支持`);
+
+        decoder.configure({
+          codec: trackInfo.codec,
+          codedWidth: trackInfo.track_width,
+          codedHeight: trackInfo.track_height,
+          description,
+          optimizeForLatency: true,
+        });
+        ok("解码器配置成功");
+
+        let sampleCount = 0;
+        file.onSamples = (id, user, samples) => {
+          for (const s of samples) {
+            sampleCount++;
+            decoder.decode(new EncodedVideoChunk({
+              type: s.is_sync ? "key" : "delta",
+              timestamp: (s.cts / s.timescale) * 1e6,
+              duration: (s.duration / s.timescale) * 1e6,
+              data: s.data,
+            }));
+          }
+        };
+        file.setExtractionOptions(trackInfo.id, null, { nbSamples: 10 });
+        file.start();
+
+        for (const seg of segs) push(seg);
+        file.flush();
+
+        await decoder.flush();
+
+        if (sampleCount > 0) {
+          ok(`提取出 ${sampleCount} 个 sample`);
+        } else {
+          fail("未提取到任何 sample —— setExtractionOptions/start 用法有误");
+        }
+
+        if (frames.length > 0) {
+          const f0 = frames[0];
+          ok(`解码出 ${frames.length} 帧，首帧 ${f0.w}×${f0.h} ` +
+             `format=${f0.fmt} ts=${f0.ts}`);
+          // 尺寸必须与轨道一致
+          if (f0.w === trackInfo.track_width && f0.h === trackInfo.track_height) {
+            ok("帧尺寸与轨道信息一致");
+          } else {
+            fail(`帧尺寸 ${f0.w}×${f0.h} 与轨道 ` +
+                 `${trackInfo.track_width}×${trackInfo.track_height} 不符`);
+          }
+          // 时间戳应单调递增
+          let mono = true;
+          for (let i = 1; i < frames.length; i++) {
+            if (frames[i].ts < frames[i - 1].ts) mono = false;
+          }
+          if (mono) ok("帧时间戳单调递增");
+          else fail("帧时间戳非单调 —— 时基换算有误");
+        } else {
+          fail("未解码出任何帧");
+        }
+
+        decoder.close();
+        finish(log.some((l) => l.startsWith("FAIL")) ? "failed" : "passed");
+      } catch (err) {
+        if (err.message !== "__handled__") {
+          fail(err.message + "\n" + (err.stack || ""));
+          finish("error");
+        }
+      }
+    </script>
+  </body>
+</html>

@@ -43,6 +43,8 @@
         "src/cnn.js",
         "models/xlsr-dynamic.onnx",
         "vendor/ort/*",
+        "vendor/mp4box/*",
+        "src/decode.js",
         "src/grain.wgsl",
         "src/badge.wgsl"
       ],
