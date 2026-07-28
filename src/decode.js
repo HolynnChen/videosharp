@@ -15,13 +15,32 @@
  *     在途帧过多而 stall（backpressure），表现为解码卡死。
  */
 
-const MP4BOX_URL = chrome.runtime.getURL("vendor/mp4box/mp4box.all.mjs");
+/* 延迟解析 URL，不在模块顶层。
+ *
+ * 顶层写 chrome.runtime.getURL(...) 会让这个模块只能在扩展环境里被 import
+ * —— 测试环境或任何非扩展宿主一 import 就抛 "Cannot read properties of
+ * undefined"。改为首次使用时求值，并允许注入以便测试。 */
+let mp4boxUrl = null;
+
+/** 可在非扩展环境（如测试）里覆盖 mp4box 的加载地址 */
+export function setMP4BoxUrl(url) {
+  mp4boxUrl = url;
+}
+
+function resolveMP4BoxUrl() {
+  if (mp4boxUrl) return mp4boxUrl;
+  if (typeof chrome !== "undefined" && chrome.runtime?.getURL) {
+    return chrome.runtime.getURL("vendor/mp4box/mp4box.all.mjs");
+  }
+  // 非扩展环境下的合理默认，便于本地调试与测试
+  return "/vendor/mp4box/mp4box.all.mjs";
+}
 
 let mp4boxPromise = null;
 async function loadMP4Box() {
   if (!mp4boxPromise) {
     // 新版 mp4box 是纯命名导出，没有 default —— 直接取整个 namespace
-    mp4boxPromise = import(MP4BOX_URL);
+    mp4boxPromise = import(resolveMP4BoxUrl());
     mp4boxPromise.catch(() => { mp4boxPromise = null; });
   }
   return mp4boxPromise;

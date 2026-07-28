@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head><meta charset="utf-8" /><title>e2e presuperres</title></head>
+  <body>
+    <pre id="result">running</pre>
+    <script>
+      /* 必须用非 module 的前置 script 设置 chrome 桩。
+       * ES module 的 import 会被提升到模块顶部求值，写在 module 内的赋值
+       * 来不及在被导入模块读取 chrome.runtime.getURL 之前生效。 */
+      globalThis.chrome = globalThis.chrome || {
+        runtime: { getURL: (p) => "/" + p },
+      };
+    </script>
+    <script type="module">
+      /* 预超分完整链路端到端测试。
+       *
+       * 走一遍真实流程：
+       *   真实 fMP4 分片
+       *     → decode.js 解析 + 解码
+       *     → superres-encode.js 超分 + 重编码
+       *     → frame-store.js 存储
+       *     → FramePlayer 按时间检索 + 解码
+       *     → 验证取出的帧尺寸/时间戳正确
+       *
+       * 这是整个方案能否工作的最终判据。前面每一步都单独测过，但模块间的
+       * 接口（时间戳单位、decoderConfig 传递、GOP 边界）只有串起来才暴露。
+       */
+      const log = [];
+      const fail = (m) => log.push("FAIL: " + m);
+      const ok = (m) => {
+        log.push("ok: " + m);
+        // 实时刷新，超时时能看到卡在哪一步
+        document.getElementById("result").textContent = log.join("\n");
+      };
+      const finish = (status) => {
+        document.getElementById("result").textContent =
+          JSON.stringify({ status, log }, null, 2);
+        window.__done = { status, log };
+      };
+
+      try {
+        if (!navigator.gpu) throw new Error("无 WebGPU");
+        if (typeof VideoDecoder === "undefined") throw new Error("无 WebCodecs");
+
+        const adapter = await navigator.gpu.requestAdapter();
+        const device = await adapter.requestDevice();
+
+        const { TrackDecoder } = await import("/src/decode.js");
+        const { SuperResEncoder } = await import("/src/superres-encode.js");
+        const { FrameStore, FramePlayer } = await import("/src/frame-store.js");
+        ok("三个模块加载成功");
+
+        /* ---- 准备测试数据 ---- */
+        const H264_OK = (await VideoDecoder.isConfigSupported({
+          codec: "avc1.64001e", codedWidth: 640, codedHeight: 360,
+        }).catch(() => ({ supported: false }))).supported;
+        const prefix = H264_OK ? "" : "vp9-";
+        const initBuf = await (await fetch(`/test/${prefix}init.mp4`)).arrayBuffer();
+        const segBufs = [];
+        for (const n of [0, 1]) {
+          segBufs.push(await (await fetch(`/test/${prefix}seg${n}.m4s`)).arrayBuffer());
+        }
+        ok(`测试数据就绪（${H264_OK ? "H.264" : "VP9"}）`);
+
+        /* ---- 阶段 1: 解码源分片 ---- */
+        const decoded = [];
+        const dec = await new TrackDecoder(
+          (frame) => {
+            // 立刻超分编码，然后 close —— 不积压 VideoFrame（它很占显存）
+            decoded.push({ ts: frame.timestamp, w: frame.displayWidth,
+                           h: frame.displayHeight, frame });
+          },
+          (e) => fail("解码错误: " + e.message),
+        ).init();
+
+        dec.pushSegment(initBuf);
+        for (const s of segBufs) dec.pushSegment(s);
+        await dec.flush();
+
+        if (decoded.length === 0) {
+          fail("阶段1：未解码出任何帧");
+          finish("failed");
+          throw new Error("__handled__");
+        }
+        const srcW = decoded[0].w, srcH = decoded[0].h;
+        ok(`阶段1 解码 ${decoded.length} 帧 ${srcW}×${srcH}`);
+
+        /* ---- 阶段 2+3: 超分 + 编码 → 存储 ---- */
+        const OUT_W = srcW * 2, OUT_H = srcH * 2;
+        const easuCode = await (await fetch("/src/easu.wgsl")).text();
+        const sr = await new SuperResEncoder(device, easuCode)
+          .init(OUT_W, OUT_H, 30);
+
+        const store = new FrameStore();
+        sr.onChunk = (chunk, meta) => store.add(chunk, meta);
+
+        // 只处理前 40 帧，软件编码很慢
+        // 软件编码约 50ms/帧，取 12 帧足够覆盖一个 GOP 边界与检索逻辑
+        const LIMIT = Math.min(12, decoded.length);
+        let ok3 = 0;
+        for (let i = 0; i < LIMIT; i++) {
+          if (sr.process(decoded[i].frame)) ok3++;
+        }
+        await sr.finish();
+        // 释放源帧
+        for (const d of decoded) d.frame.close();
+
+        ok(`阶段2 超分编码 ${ok3}/${LIMIT} 帧 → ${OUT_W}×${OUT_H}`);
+
+        if (store.chunks.length === 0) {
+          fail("阶段3：FrameStore 未收到任何 chunk");
+          finish("failed");
+          throw new Error("__handled__");
+        }
+        ok(`阶段3 存储 ${store.chunks.length} 个 chunk，` +
+           `${(store.totalBytes / 1024).toFixed(1)}KB`);
+
+        if (store.decoderConfig) {
+          ok(`  decoderConfig 已捕获: ${store.decoderConfig.codec}`);
+        } else {
+          fail("  decoderConfig 未捕获 —— 播放端无法配置解码器");
+        }
+
+        const span = store.span;
+        ok(`  时间跨度 ${(span.from / 1000).toFixed(0)}~${(span.to / 1000).toFixed(0)}ms`);
+
+        /* ---- 阶段 4: locate 正确性 ---- */
+        const mid = store.chunks[Math.floor(store.chunks.length / 2)];
+        const loc = store.locate(mid.ts);
+        if (loc && store.chunks[loc.gopStart].type === "key") {
+          ok(`阶段4 locate(${mid.ts}) → GOP 起点 ${loc.gopStart}（关键帧）`);
+        } else {
+          fail(`阶段4 locate 未回退到关键帧: ${JSON.stringify(loc)}`);
+        }
+        // 边界：时间早于所有 chunk 应返回 null
+        if (store.locate(-1_000_000) === null) {
+          ok("  locate 越界返回 null");
+        } else {
+          fail("  locate 对越界时间未返回 null");
+        }
+
+        /* ---- 阶段 5: 按时间检索并解码 ---- */
+        const player = new FramePlayer(store);
+        const targetTs = mid.ts;
+
+        // 首次必然 miss（需异步解码）
+        const first = player.get(targetTs);
+        if (first === null) {
+          ok("阶段5 首次 get 返回 null 并触发解码（符合设计）");
+        } else {
+          ok("阶段5 首次 get 即命中");
+        }
+
+        // 等解码完成
+        let got = null;
+        for (let i = 0; i < 100 && !got; i++) {
+          await new Promise((r) => setTimeout(r, 50));
+          got = player.get(targetTs);
+        }
+
+        if (got) {
+          ok(`阶段5 取到超分帧 ${got.displayWidth}×${got.displayHeight} ` +
+             `ts=${got.timestamp}`);
+          if (got.displayWidth === OUT_W && got.displayHeight === OUT_H) {
+            ok(`  尺寸正确（已放大到 ${OUT_W}×${OUT_H}）`);
+          } else {
+            fail(`  尺寸错误: ${got.displayWidth}×${got.displayHeight}, ` +
+                 `期望 ${OUT_W}×${OUT_H}`);
+          }
+          // 时间戳应落在目标附近（半帧容差内）
+          if (Math.abs(got.timestamp - targetTs) < 50_000) {
+            ok(`  时间戳对齐（差 ${Math.abs(got.timestamp - targetTs)}µs）`);
+          } else {
+            fail(`  时间戳偏离过大: ${got.timestamp} vs ${targetTs}`);
+          }
+        } else {
+          fail("阶段5 5 秒内未取到超分帧");
+        }
+
+        /* ---- 阶段 6: prune 与 reset ---- */
+        const before = store.chunks.length;
+        store.prune(span.to);   // 以最后一帧为播放头，前面的应被裁
+        ok(`阶段6 prune: ${before} → ${store.chunks.length} 个 chunk`);
+        // 裁剪后剩余的首个 chunk 必须仍是关键帧，否则无法解码
+        if (!store.chunks.length || store.chunks[0].type === "key") {
+          ok("  裁剪后首帧仍为关键帧（可独立解码）");
+        } else {
+          fail("  裁剪破坏了 GOP 边界 —— 剩余首帧非关键帧");
+        }
+
+        player.reset();
+        ok("阶段6 reset 正常");
+
+        player.close();
+        await sr.close();
+        await dec.close();
+        ok("全部资源已释放");
+
+        finish(log.some((l) => l.startsWith("FAIL")) ? "failed" : "passed");
+      } catch (err) {
+        if (err.message !== "__handled__") {
+          fail(err.message + "\n" + (err.stack || ""));
+          finish("error");
+        }
+      }
+    </script>
+  </body>
+</html>
