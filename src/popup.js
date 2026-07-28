@@ -13,11 +13,13 @@ const DEFAULTS = {
   badge: "corner",
   mseProbe: false,
   preSuperRes: false,
+  preSuperResMode: "raw",
+  preSuperResBudget: 512,
 };
 
-const SLIDERS = ["strength", "deblock", "deband", "contrast", "grain", "grainSize"];
+const SLIDERS = ["strength", "deblock", "deband", "contrast", "grain", "grainSize", "preSuperResBudget"];
 const CHECKBOXES = ["enabled", "denoise", "compare", "mseProbe", "preSuperRes"];
-const SELECTS = ["upscale", "upscaler", "badge"];
+const SELECTS = ["upscale", "upscaler", "badge", "preSuperResMode"];
 
 const el = (id) => document.getElementById(id);
 

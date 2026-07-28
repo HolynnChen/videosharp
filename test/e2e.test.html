@@ -193,6 +193,87 @@
 
         player.close();
         await sr.close();
+        ok("编码模式资源已释放");
+
+        /* ---- 阶段 7: 无编码模式 ----
+         * 直接缓存 VideoFrame，省掉编解码。关键验证：
+         *   - 容量按显存预算自适应（而非写死秒数）
+         *   - 超预算时淘汰最旧而非崩溃
+         *   - 检索命中且尺寸正确 */
+        const { FrameCache, SuperResCache } =
+          await import("/src/frame-cache.js");
+
+        // 故意给很小的预算，验证淘汰逻辑
+        const SMALL_MB = 4;
+        const cache = new FrameCache(SMALL_MB);
+        const cap = cache.capacityFor(OUT_W, OUT_H);
+        ok(`阶段7 预算 ${SMALL_MB}MB → ${OUT_W}×${OUT_H} 可缓存 ${cap} 帧 ` +
+           `(每帧约 ${(cache.perFrameBytes / 1024).toFixed(0)}KB)`);
+        if (cap >= 1) ok("  容量计算合理");
+        else fail("  容量算成 0，预算逻辑有误");
+
+        const rawProc = await new SuperResCache(device, easuCode, cache)
+          .init(OUT_W, OUT_H);
+
+        // 重新解码一批源帧（前面的已 close）
+        const frames2 = [];
+        const dec2 = await new TrackDecoder(
+          (f) => frames2.push(f),
+          (e) => fail("阶段7 解码错误: " + e.message),
+        ).init();
+        dec2.pushSegment(initBuf);
+        for (const sg of segBufs) dec2.pushSegment(sg);
+        await dec2.flush();
+
+        // 故意喂超过容量的帧数，验证淘汰
+        const feed = Math.min(cap + 5, frames2.length);
+        let rawOk = 0;
+        for (let i = 0; i < feed; i++) {
+          if (rawProc.process(frames2[i])) rawOk++;
+        }
+        for (const f of frames2) f.close();
+
+        ok(`阶段7 处理 ${rawOk}/${feed} 帧（超容量 ${feed - cap} 帧）`);
+        const st = cache.stats;
+        ok(`  缓存 ${st.frames} 帧 / ${st.mb.toFixed(1)}MB ` +
+           `(预算 ${st.budgetMb}MB, 已淘汰 ${st.evicted})`);
+
+        if (st.mb <= st.budgetMb) {
+          ok("  未超出显存预算");
+        } else {
+          fail(`  超出预算: ${st.mb.toFixed(1)} > ${st.budgetMb}MB`);
+        }
+        if (feed > cap && st.evicted > 0) {
+          ok("  超容量时正确淘汰了旧帧");
+        } else if (feed > cap) {
+          fail("  超容量但未淘汰 —— 会持续增长直到 OOM");
+        }
+
+        // 检索：取最后一帧的时间戳应能命中
+        if (cache.frames.length) {
+          const lastTs = cache.frames[cache.frames.length - 1].ts;
+          const hit = cache.get(lastTs);
+          if (hit) {
+            ok(`  检索命中 ${hit.displayWidth}×${hit.displayHeight}`);
+            if (hit.displayWidth === OUT_W && hit.displayHeight === OUT_H) {
+              ok("  尺寸正确（已超分）");
+            } else {
+              fail(`  尺寸错误 ${hit.displayWidth}×${hit.displayHeight}`);
+            }
+          } else {
+            fail("  用已存在的时间戳检索却未命中");
+          }
+          // 过旧的时间戳不该命中（否则画面会滞后）
+          if (cache.get(lastTs - 5_000_000) === null) {
+            ok("  过旧时间戳正确返回 null");
+          } else {
+            fail("  过旧时间戳仍命中 —— 会显示滞后画面");
+          }
+        }
+
+        rawProc.close();
+        cache.clear();
+        await dec2.close();
         await dec.close();
         ok("全部资源已释放");
 

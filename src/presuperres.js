@@ -40,52 +40,81 @@ export class PreSuperRes {
     this.failed = false;
     this.reason = "";
     this.stats = { segments: 0, decoded: 0, encoded: 0 };
+    this.mode = "encode";
+    this.cache = null;      // raw 模式
+    this.rawProc = null;    // raw 模式
     this.onMessage = this.onMessage.bind(this);
   }
 
   /**
-   * 启用。会先做编码器自检 —— 不达标不启用。
-   * @returns {Promise<boolean>}
+   * 启用。
+   * @param mode "encode"（省显存，需硬件编码器）| "raw"（吃显存，零编解码开销）
+   * @param budgetMB raw 模式的显存预算
    */
-  async start(outW, outH) {
+  async start(outW, outH, mode = "encode", budgetMB = 512) {
     if (this.failed) return false;
+    this.mode = mode;
     try {
-      const { canEncodeInRealtime, SuperResEncoder } =
-        await import(chrome.runtime.getURL("src/superres-encode.js"));
-
-      // 关键自检：软件编码下方案不成立，必须提前判断而非跑起来再卡
-      const rt = await canEncodeInRealtime(outW, outH);
-      if (!rt.ok) {
-        this.failed = true;
-        this.reason = rt.reason;
-        console.warn("[VidSharp/presr] 不启用预超分:", rt.reason);
-        return false;
-      }
-      console.log(
-        `[VidSharp/presr] 编码器 ${rt.codec.name} ` +
-        `${rt.msPerFrame.toFixed(1)}ms/帧，处理速度为播放的 ${rt.ratio.toFixed(1)}x`,
-      );
-
       const { TrackDecoder } = await import(chrome.runtime.getURL("src/decode.js"));
-      const { FrameStore, FramePlayer } =
-        await import(chrome.runtime.getURL("src/frame-store.js"));
-
       this.outSize = { w: outW, h: outH };
-      this.store = new FrameStore();
-      this.player = new FramePlayer(this.store);
 
-      this.encoder = await new SuperResEncoder(this.device, this.easuCode)
-        .init(outW, outH, 30);
-      this.encoder.onChunk = (chunk, meta) => {
-        this.store.add(chunk, meta);
-        this.stats.encoded++;
-      };
+      if (mode === "raw") {
+        /* 无编码模式：直接缓存 VideoFrame。没有编码器速度这道坎，但显存
+         * 决定了能领先多久 —— 按预算反算容量，而不是写死秒数。 */
+        const { FrameCache, SuperResCache } =
+          await import(chrome.runtime.getURL("src/frame-cache.js"));
+        this.cache = new FrameCache(budgetMB);
+        const cap = this.cache.capacityFor(outW, outH);
+        this.rawProc = await new SuperResCache(
+          this.device, this.easuCode, this.cache,
+        ).init(outW, outH);
+        console.log(
+          `[VidSharp/presr] 无编码模式：预算 ${budgetMB}MB，` +
+          `${outW}×${outH} 每帧约 ${(this.cache.perFrameBytes / 1024).toFixed(0)}KB，` +
+          `可缓存约 ${cap} 帧（30fps 下 ${(cap / 30).toFixed(1)} 秒）`,
+        );
+      } else {
+        const { canEncodeInRealtime, SuperResEncoder } =
+          await import(chrome.runtime.getURL("src/superres-encode.js"));
+
+        // 关键自检：软件编码下方案不成立，必须提前判断而非跑起来再卡
+        const rt = await canEncodeInRealtime(outW, outH);
+        if (!rt.ok) {
+          this.failed = true;
+          this.reason = rt.reason + "（可改用无编码模式）";
+          console.warn("[VidSharp/presr] 不启用预超分:", this.reason);
+          return false;
+        }
+        console.log(
+          `[VidSharp/presr] 编码模式：${rt.codec.name} ` +
+          `${rt.msPerFrame.toFixed(1)}ms/帧，处理速度为播放的 ${rt.ratio.toFixed(1)}x`,
+        );
+
+        const { FrameStore, FramePlayer } =
+          await import(chrome.runtime.getURL("src/frame-store.js"));
+        this.store = new FrameStore();
+        this.player = new FramePlayer(this.store);
+
+        this.encoder = await new SuperResEncoder(this.device, this.easuCode)
+          .init(outW, outH, 30);
+        this.encoder.onChunk = (chunk, meta) => {
+          this.store.add(chunk, meta);
+          this.stats.encoded++;
+        };
+      }
 
       this.decoder = await new TrackDecoder(
         (frame) => {
           this.stats.decoded++;
-          // 立刻超分编码后释放 —— VideoFrame 很占显存，不能积压
-          try { this.encoder?.process(frame); } finally { frame.close(); }
+          /* 立刻处理后释放源帧 —— VideoFrame 很占显存，积压会让解码器
+           * 因在途帧过多而 stall。注意 raw 模式下 process 内部会另建一个
+           * 输出帧存进缓存，源帧仍需在此关闭。 */
+          try {
+            if (this.mode === "raw") this.rawProc?.process(frame);
+            else this.encoder?.process(frame);
+          } finally {
+            frame.close();
+          }
         },
         (err) => {
           console.warn("[VidSharp/presr] 解码失败，停用预超分:", err);
@@ -123,10 +152,17 @@ export class PreSuperRes {
    * @returns {VideoFrame|null} null 表示未命中，调用方应回落实时管线
    */
   getFrame(currentTimeS) {
-    if (!this.enabled || this.failed || !this.player) return null;
+    if (!this.enabled || this.failed) return null;
     const us = Math.round(currentTimeS * 1e6);
-    const frame = this.player.get(us);
-    // 顺便按播放头淘汰旧缓存，控制内存
+
+    if (this.mode === "raw") {
+      const frame = this.cache?.get(us) ?? null;
+      // raw 模式必须勤于淘汰 —— 每帧几 MB，攒着很快就爆预算
+      this.cache?.prune(us);
+      return frame;
+    }
+
+    const frame = this.player?.get(us) ?? null;
     if (this.stats.encoded % 30 === 0) this.store?.prune(us);
     return frame;
   }
@@ -134,15 +170,29 @@ export class PreSuperRes {
   /** seek 后已解码的帧全部失效 */
   onSeek() {
     this.player?.reset();
+    // raw 模式下缓存的帧时间戳已失效，全部丢弃
+    this.cache?.clear();
   }
 
-  get info() {
+  /** @param currentTimeS 用于算领先量；不传则只报缓存量 */
+  info(currentTimeS = 0) {
     if (this.failed) return `预超分不可用: ${this.reason}`;
     if (!this.enabled) return "预超分未启用";
+
+    const us = Math.round(currentTimeS * 1e6);
+    if (this.mode === "raw") {
+      const st = this.cache?.stats ?? { frames: 0, mb: 0, budgetMb: 0 };
+      const ahead = this.cache?.aheadSeconds(us) ?? 0;
+      return (
+        `预超分(无编码): 领先 ${ahead.toFixed(1)}s / ` +
+        `${st.frames} 帧 / ${st.mb.toFixed(0)}·${st.budgetMb.toFixed(0)}MB`
+      );
+    }
     const span = this.store?.span ?? { from: 0, to: 0 };
+    const ahead = Math.max(0, (span.to - us) / 1e6);
     return (
-      `预超分: ${this.stats.encoded} 帧已备 / ` +
-      `${((span.to - span.from) / 1e6).toFixed(1)}s / ` +
+      `预超分(编码): 领先 ${ahead.toFixed(1)}s / ` +
+      `${this.stats.encoded} 帧 / ` +
       `${((this.store?.totalBytes ?? 0) / 1024 / 1024).toFixed(1)}MB`
     );
   }
@@ -158,6 +208,10 @@ export class PreSuperRes {
     this.decoder = null;
     this.store?.clear();
     this.store = null;
+    this.rawProc?.close();
+    this.rawProc = null;
+    this.cache?.clear();
+    this.cache = null;
   }
 }
 

@@ -52,8 +52,10 @@ const DEFAULTS = {
   upscale: "2k",     // off | 2k | 4k | 2x
   upscaler: "easu",  // easu | ravu | xlsr — 放大算法
   compare: false,    // 拖动对比模式
-  badge: "corner",   // off | corner | detail — 增强状态标识
-  preSuperRes: false, // 预超分（实验性，需硬件编码器）
+  badge: "corner",   // off | corner | detail | perf — 增强状态标识
+  preSuperRes: false,      // 预超分（实验性）
+  preSuperResMode: "raw",  // encode（省显存，需硬件编码器）| raw（吃显存，零编解码开销）
+  preSuperResBudget: 512,  // raw 模式显存预算 MB
 };
 
 let settings = { ...DEFAULTS };
@@ -263,6 +265,74 @@ async function ensureCnn(shaders, interFormat) {
   }
 }
 
+/* 渲染性能统计。
+ *
+ * 排查卡顿必须区分三件事，只看"帧率"会误判：
+ *   - 渲染帧率：我们实际画了多少帧
+ *   - 视频帧率：解码器送出多少帧（rVFC 的触发次数上限）
+ *   - GPU 耗时：单帧处理占了多少预算
+ *
+ * 渲染帧率低于视频帧率 = 我们跟不上（真卡顿）；
+ * 两者接近但都低 = 视频本身帧率低或网络卡（不是我们的问题）。
+ */
+class PerfStats {
+  constructor() {
+    this.reset();
+  }
+
+  reset() {
+    this.renderTimes = [];      // 最近若干帧的 GPU 提交耗时
+    this.frameStamps = [];      // 最近若干帧的时间点，用于算 fps
+    this.presentedFrames = 0;   // rVFC 报告的已呈现视频帧数
+    this.lastPresented = 0;
+    this.droppedFrames = 0;
+    this.videoFps = 0;
+    this.maxSamples = 60;
+  }
+
+  /** 每帧渲染结束时调用 */
+  record(ms, rvfcMeta) {
+    const now = performance.now();
+    this.renderTimes.push(ms);
+    this.frameStamps.push(now);
+    if (this.renderTimes.length > this.maxSamples) this.renderTimes.shift();
+    if (this.frameStamps.length > this.maxSamples) this.frameStamps.shift();
+
+    /* rVFC 的 metadata 直接给出解码器已呈现/已丢弃的帧数，比自己数更准 ——
+     * 它能区分"我们没画"和"解码器没给"。 */
+    if (rvfcMeta) {
+      if (typeof rvfcMeta.presentedFrames === "number") {
+        const delta = rvfcMeta.presentedFrames - this.lastPresented;
+        if (this.lastPresented && delta > 1) {
+          // 视频帧号跳跃 = 我们漏掉了中间帧
+          this.droppedFrames += delta - 1;
+        }
+        this.lastPresented = rvfcMeta.presentedFrames;
+        this.presentedFrames = rvfcMeta.presentedFrames;
+      }
+    }
+  }
+
+  /** 实际渲染帧率（按最近样本的时间跨度算） */
+  get fps() {
+    if (this.frameStamps.length < 2) return 0;
+    const span = this.frameStamps[this.frameStamps.length - 1] - this.frameStamps[0];
+    if (span <= 0) return 0;
+    return ((this.frameStamps.length - 1) * 1000) / span;
+  }
+
+  /** 单帧渲染耗时中位数。用中位数而非均值 —— 偶发长帧不该主导判断 */
+  get medianMs() {
+    if (!this.renderTimes.length) return 0;
+    const sorted = [...this.renderTimes].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  }
+
+  get maxMs() {
+    return this.renderTimes.length ? Math.max(...this.renderTimes) : 0;
+  }
+}
+
 /* ---------- 处理会话 ---------- */
 
 class Session {
@@ -294,6 +364,7 @@ class Session {
     this.ravuLut = null;   // 共享纹理，会话结束不销毁
     this.cnn = null;
     this.activeUpscaler = "EASU";  // 实际生效的放大器，供角标显示
+    this.perf = new PerfStats();
     this.presr = null;
     this.presrTex = null;
     this.presrTexSize = null;
@@ -545,7 +616,51 @@ class Session {
       if (settings.contrast > 0) fx.push(`对比 ${settings.contrast}`);
       return `VidSharp · ${size}${fx.length ? " · " + fx.join(" / ") : ""}`;
     }
+    if (settings.badge === "perf") {
+      const p = this.perf;
+      const fps = p.fps;
+      // 视频本身的帧率上限：rVFC 不会超过它，所以低 fps 不一定是我们的锅
+      const parts = [
+        `${fps.toFixed(0)}fps`,
+        `${p.medianMs.toFixed(1)}ms`,
+      ];
+      if (p.maxMs > p.medianMs * 2) {
+        // 最大值远高于中位数说明有卡顿尖峰，这才是"偶尔卡一下"的来源
+        parts.push(`峰${p.maxMs.toFixed(0)}ms`);
+      }
+      if (p.droppedFrames > 0) parts.push(`丢${p.droppedFrames}`);
+      parts.push(upscaled ? (this.activeUpscaler || "EASU") : "无放大");
+      if (upscaled) parts.push(`${ow}×${oh}`);
+      // 预超分的领先量是它是否真在起作用的直接证据
+      if (this.presr?.enabled) {
+        const us = this.video.currentTime;
+        const st = this.presr.mode === "raw"
+          ? this.presr.cache?.stats
+          : null;
+        const ahead = this.presr.mode === "raw"
+          ? (this.presr.cache?.aheadSeconds(Math.round(us * 1e6)) ?? 0)
+          : 0;
+        parts.push(`预备${ahead.toFixed(1)}s`);
+        if (st) parts.push(`${st.mb.toFixed(0)}MB`);
+      }
+      return `VidSharp · ${parts.join(" · ")}`;
+    }
+
     return upscaled ? `VidSharp ${oh}p` : "VidSharp";
+  }
+
+  /* perf 模式下角标每秒刷新一次。
+   *
+   * 不能走 updateBadge 的"文案变了就重建纹理"路径 —— fps 每帧都在变，
+   * 那样会每帧重建一次纹理（2D canvas 渲文字 + 上传 GPU），反而制造卡顿。
+   * 这里限流到 1Hz，并复用同一张纹理尺寸。 */
+  maybeUpdatePerfBadge() {
+    if (settings.badge !== "perf") return;
+    const now = performance.now();
+    if (now - (this.lastPerfBadge || 0) < 1000) return;
+    this.lastPerfBadge = now;
+    this.badgeText = null;      // 强制重算
+    this.updateBadge();
   }
 
   /** 把文案渲染成 GPU 纹理。文案未变则直接复用。 */
@@ -658,7 +773,10 @@ class Session {
       // 尺寸要等 videoWidth 就绪；syncSizes 已在 attachOverlay 里跑过
       if (!this.outSize.w) return;
       const p = new mod.PreSuperRes(this.device, shaders.easu);
-      const ok = await p.start(this.outSize.w, this.outSize.h);
+      const ok = await p.start(
+        this.outSize.w, this.outSize.h,
+        settings.preSuperResMode, settings.preSuperResBudget,
+      );
       if (ok) {
         this.presr = p;
         notify("预超分已启用（实验性）");
@@ -840,6 +958,7 @@ class Session {
 
   scheduleNext() {
     if (!this.running) return;
+    // rVFC 的第二个参数带 presentedFrames/processingDuration 等诊断信息
     this.rvfcHandle = this.video.requestVideoFrameCallback(this.renderFrame);
   }
 
@@ -862,8 +981,9 @@ class Session {
     pass.end();
   }
 
-  async renderFrame() {
+  async renderFrame(_now, rvfcMeta) {
     if (!this.running) return;
+    const tStart = performance.now();
     // CNN 推理是异步的，慢帧可能与下一次 rVFC 回调重叠。重入会让两帧
     // 争用同一批 GPU buffer，必须丢弃而非排队 —— 视频场景下延迟比完整
     // 性更重要。
@@ -894,6 +1014,8 @@ class Session {
             this.activeUpscaler = "预超分";
             this.refreshBadge();
           }
+          this.perf.record(performance.now() - tStart, rvfcMeta);
+          this.maybeUpdatePerfBadge();
           return;   // finally 会清 rendering 并续帧
         }
         // 未命中就回落实时管线（下面的正常流程）
@@ -1039,6 +1161,8 @@ class Session {
       this.consecutiveFailures = 0;
       this.canvas.classList.add("vidsharp-visible");
       this.firstFrameDone = true;
+      this.perf.record(performance.now() - tStart, rvfcMeta);
+      this.maybeUpdatePerfBadge();
     } catch (err) {
       this.consecutiveFailures++;
       if (this.consecutiveFailures >= 5) {
@@ -1193,7 +1317,8 @@ function init() {
       if (key === "compare") compare = true;
       if (key === "badge") badgeMode = true;
       // 预超分依赖 MAIN world 捕获脚本的注册状态，切换后需重建会话
-      if (key === "preSuperRes") rebuild = true;
+      if (key === "preSuperRes" || key === "preSuperResMode"
+          || key === "preSuperResBudget") rebuild = true;
     }
 
     for (const video of document.querySelectorAll("video")) {

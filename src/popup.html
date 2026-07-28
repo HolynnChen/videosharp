@@ -186,6 +186,7 @@
         <select id="badge">
           <option value="corner">简洁</option>
           <option value="detail">详细参数</option>
+          <option value="perf">性能诊断</option>
           <option value="off">关闭</option>
         </select>
       </div>
@@ -203,6 +204,26 @@
         预超分（实验性）
       </label>
       <input type="checkbox" id="preSuperRes" />
+    </div>
+
+    <div class="row">
+      <label for="preSuperResMode" title="无编码：零编解码开销、无二次画质损失，但吃显存；编码：省显存但需硬件编码器">
+        预超分模式
+      </label>
+      <select id="preSuperResMode">
+        <option value="raw">无编码（吃显存）</option>
+        <option value="encode">编码（省显存）</option>
+      </select>
+    </div>
+
+    <div class="slider">
+      <div class="row">
+        <label for="preSuperResBudget" title="无编码模式的显存上限，决定能领先播放头多久">
+          显存预算
+        </label>
+        <span class="value" id="preSuperResBudgetValue">512</span>
+      </div>
+      <input type="range" id="preSuperResBudget" min="128" max="2048" step="128" />
     </div>
 
     <div class="row">
