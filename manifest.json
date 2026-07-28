@@ -45,6 +45,7 @@
         "vendor/ort/*",
         "vendor/mp4box/*",
         "src/decode.js",
+        "src/superres-encode.js",
         "src/grain.wgsl",
         "src/badge.wgsl"
       ],

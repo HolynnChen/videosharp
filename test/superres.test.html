@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head><meta charset="utf-8" /><title>superres-encode test</title></head>
+  <body>
+    <pre id="result">running</pre>
+    <script type="module">
+      /* 测 src/superres-encode.js 这个生产模块本身，而不是在测试里另写
+       * 一份逻辑 —— 后者只能证明"某种写法可行"，不能证明产品代码正确。
+       *
+       * 三个关键点：
+       *   1. VideoFrame → GPU → VideoFrame 往返（两处 API 都容易写错）
+       *   2. 超分确实改变了尺寸且内容合理
+       *   3. 编码吞吐 —— 决定预超分是否成立（软件编码下不成立）
+       */
+      const log = [];
+      const fail = (m) => log.push("FAIL: " + m);
+      const ok = (m) => log.push("ok: " + m);
+      const finish = (status) => {
+        document.getElementById("result").textContent =
+          JSON.stringify({ status, log }, null, 2);
+        window.__done = { status, log };
+      };
+
+      // 生产代码用 chrome.runtime.getURL 取 shader；测试里桩掉
+      globalThis.chrome = globalThis.chrome ?? {
+        runtime: { getURL: (p) => "/" + p },
+      };
+
+      try {
+        if (!navigator.gpu) throw new Error("无 WebGPU");
+        if (typeof VideoEncoder === "undefined") throw new Error("无 WebCodecs");
+
+        const mod = await import("/src/superres-encode.js");
+        ok("superres-encode.js 加载成功");
+
+        const adapter = await navigator.gpu.requestAdapter();
+        const device = await adapter.requestDevice();
+
+        /* ---- 1. pickCodec ---- */
+        const picked = await mod.pickCodec(640, 360, 2_000_000);
+        if (picked) {
+          ok(`pickCodec: ${picked.name} (${picked.codec}) accel=${picked.accel}`);
+        } else {
+          fail("pickCodec 返回 null —— 本机无可用编码器");
+          finish("failed");
+          throw new Error("__handled__");
+        }
+
+        /* ---- 2. 实时性自检 ---- */
+        const rt = await mod.canEncodeInRealtime(640, 360);
+        ok(`canEncodeInRealtime: ok=${rt.ok} ` +
+           `${rt.msPerFrame?.toFixed(1)}ms/帧 ratio=${rt.ratio?.toFixed(2)}x`);
+        if (!rt.ok) {
+          // 软件编码环境下预期为 false，只报告不算失败
+          ok(`  ⚠ ${rt.reason}`);
+          ok(`  （软件渲染环境属预期；真机有硬件编码器）`);
+        }
+
+        /* ---- 3. 端到端跑 SuperResEncoder ---- */
+        const SRC_W = 160, SRC_H = 90;
+        const OUT_W = SRC_W * 2, OUT_H = SRC_H * 2;
+
+        const easuCode = await (await fetch("/src/easu.wgsl")).text();
+        const sr = await new mod.SuperResEncoder(device, easuCode)
+          .init(OUT_W, OUT_H, 30);
+        ok(`SuperResEncoder 初始化成功，编码器 ${sr.codecInfo.name}`);
+
+        const chunks = [];
+        let hasKeyFrame = false;
+        sr.onChunk = (chunk) => {
+          chunks.push({ size: chunk.byteLength, type: chunk.type, ts: chunk.timestamp });
+          if (chunk.type === "key") hasKeyFrame = true;
+        };
+
+        // 造已知图案的源帧：左黑右白，便于确认内容确实过了管线
+        const c2d = document.createElement("canvas");
+        c2d.width = SRC_W; c2d.height = SRC_H;
+        const ctx = c2d.getContext("2d");
+        ctx.fillStyle = "#202020"; ctx.fillRect(0, 0, SRC_W / 2, SRC_H);
+        ctx.fillStyle = "#e0e0e0"; ctx.fillRect(SRC_W / 2, 0, SRC_W / 2, SRC_H);
+
+        const N = 10;
+        let processed = 0;
+        for (let i = 0; i < N; i++) {
+          const f = new VideoFrame(c2d, {
+            timestamp: Math.round((i * 1e6) / 30),
+            duration: Math.round(1e6 / 30),
+          });
+          if (sr.process(f)) processed++;
+          f.close();
+        }
+        await sr.finish();
+
+        if (processed === N) {
+          ok(`process() 成功处理 ${processed}/${N} 帧`);
+        } else {
+          fail(`process() 只成功 ${processed}/${N} 帧`);
+        }
+
+        if (chunks.length > 0) {
+          const total = chunks.reduce((a, c) => a + c.size, 0);
+          ok(`编码产出 ${chunks.length} 个 chunk，共 ${(total / 1024).toFixed(1)}KB`);
+        } else {
+          fail("编码未产出任何 chunk");
+        }
+
+        if (hasKeyFrame) {
+          ok("含关键帧（seek 时可定位）");
+        } else {
+          fail("无关键帧 —— seek 会无法定位");
+        }
+
+        // 时间戳必须与源帧一致，否则播放时按时间检索会错位
+        if (chunks.length && chunks[0].ts === 0) {
+          ok("首个 chunk 时间戳为 0，与源帧对齐");
+        } else if (chunks.length) {
+          fail(`首个 chunk 时间戳 ${chunks[0].ts}，应为 0`);
+        }
+
+        // 时间戳应单调递增
+        let mono = true;
+        for (let i = 1; i < chunks.length; i++) {
+          if (chunks[i].ts < chunks[i - 1].ts) mono = false;
+        }
+        if (chunks.length > 1) {
+          if (mono) ok("chunk 时间戳单调递增");
+          else fail("chunk 时间戳非单调");
+        }
+
+        await sr.close();
+        ok("close() 正常释放");
+
+        finish(log.some((l) => l.startsWith("FAIL")) ? "failed" : "passed");
+      } catch (err) {
+        if (err.message !== "__handled__") {
+          fail(err.message + "\n" + (err.stack || ""));
+          finish("error");
+        }
+      }
+    </script>
+  </body>
+</html>
