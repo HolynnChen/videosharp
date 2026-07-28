@@ -79,6 +79,39 @@ if (popup && !fs.existsSync(path.join(ROOT, popup))) {
   fail.push(`popup ${popup} 不存在`);
 }
 
+// --- 3b. background service worker 存在 ---
+const sw = manifest.background?.service_worker;
+if (sw) {
+  if (!fs.existsSync(path.join(ROOT, sw))) {
+    fail.push(`background.service_worker ${sw} 不存在`);
+  } else {
+    ok.push(`service worker ${sw} 存在`);
+  }
+}
+
+/* --- 3c. 动态注册的 content script 存在 ---
+ * chrome.scripting.registerContentScripts 里引用的 js 文件不在 manifest 里，
+ * 静态检查很容易漏 —— 而它一旦缺失，注册会在运行时静默失败。 */
+if (sw) {
+  const swSrc = fs.readFileSync(path.join(ROOT, sw), "utf8");
+  const dyn = new Set();
+  for (const m of swSrc.matchAll(/js:\s*\[([^\]]+)\]/g)) {
+    for (const q of m[1].matchAll(/["']([^"']+)["']/g)) dyn.add(q[1]);
+  }
+  for (const f of dyn) {
+    if (!fs.existsSync(path.join(ROOT, f))) {
+      fail.push(`动态注册引用的 ${f} 不存在`);
+    }
+  }
+  if (dyn.size) ok.push(`动态注册的 ${dyn.size} 个脚本均存在`);
+
+  // 动态注册需要 scripting 权限
+  if (/registerContentScripts/.test(swSrc) &&
+      !(manifest.permissions ?? []).includes("scripting")) {
+    fail.push("使用了 registerContentScripts 但未申请 scripting 权限");
+  }
+}
+
 // --- 4. SHADERS 表里的每个 wgsl 都要真实存在 ---
 const contentSrc = fs.readFileSync(path.join(ROOT, "src/content.js"), "utf8");
 const shaderBlock = contentSrc.match(/const SHADERS = \{([\s\S]*?)\};/);

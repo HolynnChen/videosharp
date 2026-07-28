@@ -337,6 +337,53 @@ CNN 与它的差距即为模型本身的代价，与 GPU 强弱无关。
   `Cannot read properties of undefined (reading 'getBindGroupLayout')`。
   重型模型的诊断因此限制了迭代次数与 batch 上限。
 
+## MSE 流探针（开发者选项，默认关闭）
+
+用于评估「预超分」方案的可行性 —— 即**提前**拦截视频流处理好、播放时直接用，
+以摆脱每帧 16~33ms 的实时约束。
+
+popup 底部「开发者 → MSE 流探针」打开，刷新页面，播放视频后看控制台。
+它会输出截获的分片数、codec、以及两道关卡的结论。
+
+### 为什么需要探针而不直接做
+
+调研已确认三条路彻底堵死：
+
+| 路径 | 判定 | 根因 |
+|---|---|---|
+| 网络层拦截改流 | ❌ | MV3 的 `webRequest`/`declarativeNetRequest` **不能读写响应体** |
+| 读 `<video>` 已缓冲帧 | ❌ | `importExternalTexture` / `createImageBitmap` / rVFC **只给当前帧**；浏览器缓冲的是压缩比特流，不是像素 |
+| 双 video 副本 | ❌ | MSE 的 `blob:` URL **绑定到创建它的 MediaSource**，无法共享 |
+
+唯一剩下的是 **hook `SourceBuffer.prototype.appendBuffer`**。探针验证的就是这条。
+
+### 即便截到数据，仍有两道硬约束
+
+**1. 必须自己接管播放。** 超分结果不回填（回填要重编码，画质二次损失且开销
+可能超过超分本身），所以得自建播放器：fMP4 解析、音视频同步、seek、缓冲管理、
+弹幕层对齐。调研评估工作量以**人月**计，且要持续对抗站点改版。
+
+**2. 显存撑不住缓存。** 超分后是未压缩像素：
+
+| 缓存时长 | 2K | 4K |
+|---|---|---|
+| 2 秒 | 0.82 GB | 1.85 GB |
+| 5 秒 | 2.06 GB | 4.63 GB |
+
+浏览器单页显存上限通常几百 MB ~ 2GB。2 秒已在边缘，而 2 秒的提前量**不足以
+换用更重的模型** —— 仍需维持「平均处理速度 ≥ 播放速度」，只能吸收瞬时抖动。
+
+### 一个很强的旁证
+
+GitHub 上**没有任何项目做过浏览器端预超分**。所有方案（Anime4K-WebExtension
+204★、YouTube-VSR、VSR-Bench）都是实时抓当前帧。NVIDIA RTX VSR 与 Edge VSR
+也是实时逐帧 —— 靠专用硬件把单帧压进帧预算，而非预处理。
+
+技术细节：探针需两个脚本。MAIN world 的那个才能改到页面的
+`SourceBuffer.prototype`（ISOLATED world 里改的是另一个对象，对页面无效），
+但它拿不到 `chrome.*` API，只能 `postMessage` 给 ISOLATED world 的伴生脚本。
+且必须 `run_at: document_start` —— 页面脚本一旦先持有引用，补丁就绕不过去。
+
 ## 已知限制
 
 - **DRM 视频无法处理**（Netflix、Disney+ 等）。受 EME 保护的解码帧在受保护
@@ -408,6 +455,9 @@ npm run check # 只跑 manifest 检查（快，不需要浏览器）
 ```
 manifest.json          MV3 配置
 src/
+  background.js        service worker（按需注册 MSE 探针）
+  mse-probe-main.js    MSE hook（MAIN world）
+  mse-probe.js         探针伴生脚本（ISOLATED world）
   enhance.wgsl         去块 + 去色带 + 局部对比度
   easu.wgsl            EASU 方向自适应放大
   ravu.wgsl            RAVU 查表法放大（更锐，仅 2x）

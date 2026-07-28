@@ -196,9 +196,19 @@
       </div>
     </fieldset>
 
+    <div class="section">开发者</div>
+
+    <div class="row">
+      <label for="mseProbe" title="在控制台输出视频流截获情况，用于评估预超分方案可行性。会 hook 页面的 SourceBuffer">
+        MSE 流探针
+      </label>
+      <input type="checkbox" id="mseProbe" />
+    </div>
+
     <p class="hint">
       左侧为处理后，右侧为原始画面。<br />
-      受 DRM 保护的视频（Netflix 等）无法处理。
+      受 DRM 保护的视频（Netflix 等）无法处理。<br />
+      MSE 探针开关切换后需刷新页面，结论见控制台。
     </p>
 
     <script src="popup.js"></script>

@@ -11,10 +11,11 @@ const DEFAULTS = {
   upscaler: "easu",
   compare: false,
   badge: "corner",
+  mseProbe: false,
 };
 
 const SLIDERS = ["strength", "deblock", "deband", "contrast", "grain", "grainSize"];
-const CHECKBOXES = ["enabled", "denoise", "compare"];
+const CHECKBOXES = ["enabled", "denoise", "compare", "mseProbe"];
 const SELECTS = ["upscale", "upscaler", "badge"];
 
 const el = (id) => document.getElementById(id);

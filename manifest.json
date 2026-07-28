@@ -4,19 +4,29 @@
   "version": "0.1.0",
   "description": "用 WebGPU 对网页视频做 RCAS 自适应锐化，真人与动画内容通用，开销极低。",
   "minimum_chrome_version": "113",
-  "permissions": ["storage", "activeTab", "scripting"],
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
   "action": {
     "default_title": "VidSharp",
     "default_popup": "src/popup.html"
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "<all_urls>"
+      ],
       "all_frames": true,
       "match_about_blank": true,
       "run_at": "document_idle",
-      "js": ["src/content.js"],
-      "css": ["src/content.css"]
+      "js": [
+        "src/content.js"
+      ],
+      "css": [
+        "src/content.css"
+      ]
     }
   ],
   "web_accessible_resources": [
@@ -36,7 +46,12 @@
         "src/grain.wgsl",
         "src/badge.wgsl"
       ],
-      "matches": ["<all_urls>"]
+      "matches": [
+        "<all_urls>"
+      ]
     }
-  ]
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  }
 }
