@@ -10,6 +10,7 @@
  */
 
 const PROBE_ID = "vidsharp-mse-probe";
+const CAPTURE_ID = "vidsharp-capture";
 
 async function isRegistered() {
   const list = await chrome.scripting.getRegisteredContentScripts({
@@ -52,14 +53,43 @@ async function unregisterProbe() {
   console.log("[VidSharp] MSE 探针已注销");
 }
 
+/* 预超分的分片捕获脚本。与探针同样必须在 MAIN world + document_start，
+ * 但它真的把数据传出去，所以只在预超分开启时注册。 */
+async function registerCapture() {
+  const existing = await chrome.scripting.getRegisteredContentScripts({
+    ids: [CAPTURE_ID],
+  }).catch(() => []);
+  if (existing.length) return;
+  await chrome.scripting.registerContentScripts([{
+    id: CAPTURE_ID,
+    matches: ["<all_urls>"],
+    js: ["src/capture-main.js"],
+    world: "MAIN",
+    runAt: "document_start",
+    allFrames: true,
+  }]);
+  console.log("[VidSharp] 分片捕获已注册（需刷新页面生效）");
+}
+
+async function unregisterCapture() {
+  await chrome.scripting.unregisterContentScripts({ ids: [CAPTURE_ID] })
+    .catch(() => {});
+}
+
 async function sync() {
-  const { mseProbe } = await chrome.storage.sync.get({ mseProbe: false });
+  const { mseProbe, preSuperRes } = await chrome.storage.sync.get({
+    mseProbe: false, preSuperRes: false,
+  });
   if (mseProbe) await registerProbe();
   else await unregisterProbe();
+  if (preSuperRes) await registerCapture();
+  else await unregisterCapture();
 }
 
 chrome.runtime.onInstalled.addListener(sync);
 chrome.runtime.onStartup.addListener(sync);
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "sync" && "mseProbe" in changes) sync();
+  if (area === "sync" && ("mseProbe" in changes || "preSuperRes" in changes)) {
+    sync();
+  }
 });

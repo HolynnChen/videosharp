@@ -53,6 +53,7 @@ const DEFAULTS = {
   upscaler: "easu",  // easu | ravu | xlsr — 放大算法
   compare: false,    // 拖动对比模式
   badge: "corner",   // off | corner | detail — 增强状态标识
+  preSuperRes: false, // 预超分（实验性，需硬件编码器）
 };
 
 let settings = { ...DEFAULTS };
@@ -293,6 +294,9 @@ class Session {
     this.ravuLut = null;   // 共享纹理，会话结束不销毁
     this.cnn = null;
     this.activeUpscaler = "EASU";  // 实际生效的放大器，供角标显示
+    this.presr = null;
+    this.presrTex = null;
+    this.presrTexSize = null;
     this.warnedScale = false;
     this.rendering = false;
     this.firstFrameDone = false;
@@ -393,6 +397,14 @@ class Session {
     this.shaders = shaders;   // CNN 按需初始化时要用到桥接 shader
 
     this.attachOverlay();
+
+    // 预超分：拦截视频流提前处理。需硬件编码器，自检不通过会静默不启用。
+    if (settings.preSuperRes) this.initPreSuperRes(shaders);
+
+    // seek 后已解码的超分帧全部失效
+    this.onSeeking = () => this.presr?.onSeek();
+    this.video.addEventListener("seeking", this.onSeeking);
+
     this.running = true;
     this.scheduleNext();
   }
@@ -639,6 +651,81 @@ class Session {
     this.cnnInputSize = { w, h };
   }
 
+  /** 启动预超分。失败不影响实时管线。 */
+  async initPreSuperRes(shaders) {
+    try {
+      const mod = await import(chrome.runtime.getURL("src/presuperres.js"));
+      // 尺寸要等 videoWidth 就绪；syncSizes 已在 attachOverlay 里跑过
+      if (!this.outSize.w) return;
+      const p = new mod.PreSuperRes(this.device, shaders.easu);
+      const ok = await p.start(this.outSize.w, this.outSize.h);
+      if (ok) {
+        this.presr = p;
+        notify("预超分已启用（实验性）");
+      } else {
+        notify("预超分不可用：" + (p.reason || "自检未通过"));
+      }
+    } catch (err) {
+      console.warn("[VidSharp] 预超分启用失败:", err);
+    }
+  }
+
+  /** 把一个已处理好的 VideoFrame 直接画到 canvas（预超分命中时用） */
+  blitFrame(frame) {
+    if (!this.pipelines.blit) {
+      // 懒建：只有启用预超分时才需要
+      const module = this.device.createShaderModule({
+        label: "blit",
+        code: `
+          @group(0) @binding(0) var t: texture_2d<f32>;
+          @group(0) @binding(1) var s: sampler;
+          struct VO { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
+          @vertex fn vs_main(@builtin(vertex_index) i: u32) -> VO {
+            var o: VO;
+            let x = f32((i << 1u) & 2u) * 2.0 - 1.0;
+            let y = f32(i & 2u) * 2.0 - 1.0;
+            o.p = vec4<f32>(x, y, 0.0, 1.0);
+            o.uv = vec2<f32>(x * 0.5 + 0.5, 0.5 - y * 0.5);
+            return o;
+          }
+          @fragment fn fs_main(v: VO) -> @location(0) vec4<f32> {
+            return textureSampleLevel(t, s, v.uv, 0.0);
+          }`,
+      });
+      this.pipelines.blit = this.device.createRenderPipeline({
+        label: "blit", layout: "auto",
+        vertex: { module, entryPoint: "vs_main" },
+        fragment: { module, entryPoint: "fs_main",
+                    targets: [{ format: this.format }] },
+        primitive: { topology: "triangle-list" },
+      });
+    }
+
+    // VideoFrame → 纹理需要 copyExternalImageToTexture
+    // （importExternalTexture 只接受 HTMLVideoElement）
+    const w = frame.displayWidth, h = frame.displayHeight;
+    if (!this.presrTex || this.presrTexSize?.w !== w || this.presrTexSize?.h !== h) {
+      this.presrTex?.destroy();
+      this.presrTex = this.device.createTexture({
+        label: "presr-frame",
+        size: [w, h], format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+             | GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      this.presrTexSize = { w, h };
+    }
+    this.device.queue.copyExternalImageToTexture(
+      { source: frame }, { texture: this.presrTex }, [w, h],
+    );
+
+    const enc = this.device.createCommandEncoder({ label: "presr-blit" });
+    this.drawPass(enc, this.pipelines.blit, [
+      { binding: 0, resource: this.presrTex.createView() },
+      { binding: 1, resource: this.sampler },
+    ], this.ctx.getCurrentTexture().createView());
+    this.device.queue.submit([enc.finish()]);
+  }
+
   /* ---- 拖动对比 ---- */
 
   setupCompare() {
@@ -793,6 +880,24 @@ class Session {
       // 去色带与颗粒都依赖帧号做时域去相关，图案必须每帧变化，
       // 否则固定噪点会被眼睛识别为屏幕脏污
       if (settings.deband > 0 || settings.grain > 0) this.updateUniforms();
+
+      /* 预超分命中时走捷径：那一帧已经超分并编码过，直接显示即可，
+       * 不必再跑一遍 enhance/放大/锐化 —— 重复处理只会过锐并浪费算力。 */
+      if (this.presr?.enabled) {
+        const pre = this.presr.getFrame(this.video.currentTime);
+        if (pre) {
+          this.blitFrame(pre);
+          this.consecutiveFailures = 0;
+          this.canvas.classList.add("vidsharp-visible");
+          this.firstFrameDone = true;
+          if (this.activeUpscaler !== "预超分") {
+            this.activeUpscaler = "预超分";
+            this.refreshBadge();
+          }
+          return;   // finally 会清 rendering 并续帧
+        }
+        // 未命中就回落实时管线（下面的正常流程）
+      }
 
       const external = this.device.importExternalTexture({
         source: this.video,
@@ -957,6 +1062,10 @@ class Session {
       this.video.cancelVideoFrameCallback(this.rvfcHandle);
       this.rvfcHandle = null;
     }
+    if (this.onSeeking) {
+      this.video.removeEventListener("seeking", this.onSeeking);
+      this.onSeeking = null;
+    }
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.teardownCompare();
@@ -964,6 +1073,11 @@ class Session {
     // CNN 实例按会话持有（session 与 buffer 都不可共享），需异步释放
     this.cnn?.dispose();
     this.cnn = null;
+    this.presr?.stop();
+    this.presr = null;
+    this.presrTex?.destroy();
+    this.presrTex = null;
+    this.presrTexSize = null;
     this.firstFrameDone = false;
     this.canvas?.remove();
     this.canvas = null;
@@ -1078,6 +1192,8 @@ function init() {
       }
       if (key === "compare") compare = true;
       if (key === "badge") badgeMode = true;
+      // 预超分依赖 MAIN world 捕获脚本的注册状态，切换后需重建会话
+      if (key === "preSuperRes") rebuild = true;
     }
 
     for (const video of document.querySelectorAll("video")) {

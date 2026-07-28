@@ -337,6 +337,65 @@ CNN 与它的差距即为模型本身的代价，与 GPU 强弱无关。
   `Cannot read properties of undefined (reading 'getBindGroupLayout')`。
   重型模型的诊断因此限制了迭代次数与 batch 上限。
 
+## 预超分（实验性，默认关闭）
+
+**拦截视频流提前超分并缓存，播放时直接取用** —— 摆脱每帧 16~33ms 的实时约束。
+
+popup 底部「开发者 → 预超分」打开，刷新页面。角标会显示 `预超分`。
+
+### 工作原理
+
+```
+MSE appendBuffer (hook, MAIN world)
+  → mp4box.js 解析 fMP4，提取 sample
+  → VideoDecoder 解码
+  → WebGPU 超分（复用实时管线的 shader）
+  → VideoEncoder 重编码
+  → FrameStore 按时间戳存储
+  → 播放时按 currentTime 检索、解码、显示
+```
+
+**音频与时间轴完全交给原播放器。** 原 `<video>` 继续播放（视觉上被 canvas
+覆盖），我们只按它的 `currentTime` 取对应的超分帧。这样 seek、倍速、暂停、
+弹幕对齐全部免费沿用，规避了自建播放器最大的坑（音视频同步）。
+
+命中超分帧时**跳过整条实时管线**直接显示 —— 那一帧已经处理过，重复处理只会
+过锐并浪费算力。未命中则自动回落实时管线。
+
+### 硬前提：必须有硬件编码器
+
+超分后的像素存不下（2K 每帧 14MB，2 秒 0.82GB），必须重编码成压缩格式
+（2 分钟约几十 MB）。而编码速度决定方案是否成立：
+
+| 编码方式 | 2K 每帧 | 处理速度 / 播放速度 |
+|---|---|---|
+| 软件编码 | 约 2000 ms | **0.02×** ❌ 比播放慢 60 倍 |
+| 硬件编码 | 个位数 ms | **3× 以上** ✅ 能领先播放头 |
+
+所以启用前会用 `canEncodeInRealtime()` 自检：**真编几帧测耗时**，按像素数
+外推目标分辨率，低于 1.2× 直接不启用并说明原因。不能只看
+`isConfigSupported` —— 它对软件编码也返回 supported。
+
+### 关键实现细节（实测确认）
+
+- **VideoFrame → GPU 必须用 `copyExternalImageToTexture`**。
+  `importExternalTexture` 只接受 `HTMLVideoElement`。
+- **GPU → VideoFrame 没有直接 API**。桥是把纹理 blit 到配了 webgpu context
+  的 `OffscreenCanvas`，再 `new VideoFrame(canvas)`。全程留在 GPU。
+- **检索必须回退到 GOP 关键帧**。直接从中间 delta 帧解码会失败或出错误画面。
+  缓存淘汰同理只能裁到关键帧边界。
+- **捕获时必须拷贝 buffer**。原 buffer 还要交给播放器，用 transfer list
+  转移走会让页面播放崩掉。
+- **`mp4box.all.mjs` 依赖两个同目录 chunk**（rolldown-runtime 与 styp），
+  只复制主文件会 `Failed to fetch dynamically imported module`。
+
+### 已知限制
+
+- 需硬件编码器，否则不启用
+- 首次启用需刷新页面（MAIN world 脚本要在 `document_start` 注入）
+- DRM 视频无法处理（拿不到分片）
+- 内存随缓存窗口增长，默认保留播放头前 60 秒 / 后 5 秒
+
 ## MSE 流探针（开发者选项，默认关闭）
 
 用于评估「预超分」方案的可行性 —— 即**提前**拦截视频流处理好、播放时直接用，
@@ -455,9 +514,14 @@ npm run check # 只跑 manifest 检查（快，不需要浏览器）
 ```
 manifest.json          MV3 配置
 src/
-  background.js        service worker（按需注册 MSE 探针）
-  mse-probe-main.js    MSE hook（MAIN world）
+  background.js        service worker（按需注册 MAIN world 脚本）
+  mse-probe-main.js    MSE 探针 hook（MAIN world）
   mse-probe.js         探针伴生脚本（ISOLATED world）
+  capture-main.js      分片捕获（MAIN world，预超分用）
+  decode.js            fMP4 解析 + VideoDecoder 解码
+  superres-encode.js   超分 + VideoEncoder 重编码
+  frame-store.js       超分帧存储与按时间检索
+  presuperres.js       预超分协调器
   enhance.wgsl         去块 + 去色带 + 局部对比度
   easu.wgsl            EASU 方向自适应放大
   ravu.wgsl            RAVU 查表法放大（更锐，仅 2x）
@@ -477,6 +541,10 @@ models/
   xlsr-dynamic.onnx    XLSR 权重，输入空间维已放宽为动态
 test/
   check-manifest.js    manifest 与文件一致性检查
+  decode.test.html     fMP4 解析与解码
+  superres.test.html   超分编码模块
+  e2e.test.html        预超分完整链路
+  vp9-*.m4s            测试用 fMP4 分片（ffmpeg 生成）
   shaders.test.html    shader 单元测试
   run.js               测试驱动
   cnn-probe.html       CNN 可行性探针（浏览器内，测真实 GPU）

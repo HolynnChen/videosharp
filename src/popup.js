@@ -12,10 +12,11 @@ const DEFAULTS = {
   compare: false,
   badge: "corner",
   mseProbe: false,
+  preSuperRes: false,
 };
 
 const SLIDERS = ["strength", "deblock", "deband", "contrast", "grain", "grainSize"];
-const CHECKBOXES = ["enabled", "denoise", "compare", "mseProbe"];
+const CHECKBOXES = ["enabled", "denoise", "compare", "mseProbe", "preSuperRes"];
 const SELECTS = ["upscale", "upscaler", "badge"];
 
 const el = (id) => document.getElementById(id);

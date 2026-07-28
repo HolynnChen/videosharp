@@ -48,6 +48,7 @@
         "src/superres-encode.js",
         "src/frame-store.js",
         "src/capture-main.js",
+        "src/presuperres.js",
         "src/grain.wgsl",
         "src/badge.wgsl"
       ],
