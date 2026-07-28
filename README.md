@@ -369,8 +369,14 @@ Apple M1 实测（EASU pass，`npm run probe` → 完整诊断）：
 
 ```bash
 npm install
-npm test     # 用软件 WebGPU 后端验证三个 shader
+npm test     # manifest 一致性检查 + shader 验证
+npm run check # 只跑 manifest 检查（快，不需要浏览器）
 ```
+
+`check-manifest.js` 抓的是一类反复出现的低级错误：新增 shader 后忘了加到
+`web_accessible_resources`，扩展一跑就 `TypeError: Failed to fetch`。这种错误
+**只在真实扩展环境暴露**（本地 HTTP 测试照样能加载），所以必须靠静态核对。
+它做双向检查：代码 `getURL()` 引用的资源必须已声明，声明的资源文件必须存在。
 
 测试会启动带 SwiftShader 的 Chromium，把 `texture_external` 替换成
 `texture_2d` 以便注入已知像素，然后回读结果验证：
@@ -420,6 +426,7 @@ vendor/ort/            ORT WebGPU 运行时（26MB，仅 CNN 档需要）
 models/
   xlsr-dynamic.onnx    XLSR 权重，输入空间维已放宽为动态
 test/
+  check-manifest.js    manifest 与文件一致性检查
   shaders.test.html    shader 单元测试
   run.js               测试驱动
   cnn-probe.html       CNN 可行性探针（浏览器内，测真实 GPU）

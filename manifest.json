@@ -27,6 +27,7 @@
         "src/ravu.wgsl",
         "src/data/ravu-lut.js",
         "src/rcas.wgsl",
+        "src/downscale.wgsl",
         "src/to-tensor.wgsl",
         "src/from-tensor.wgsl",
         "src/cnn.js",
