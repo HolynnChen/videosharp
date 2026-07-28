@@ -42,6 +42,39 @@
     }
   }
 
+  /* 重编码是"预超分"的存储基础：超分后的未压缩像素无法缓存
+   * （2 秒 2K 就要 0.82GB），必须编码成压缩格式才能存下整段。
+   * 所以必须先确认浏览器能编码 —— 这是方案的另一个前提。 */
+  async function checkEncoders() {
+    if (typeof VideoEncoder === "undefined") {
+      console.log(`${TAG} ✗ 第三关：无 VideoEncoder，无法重编码存储`);
+      return;
+    }
+    // 目标分辨率按 2K 试；码率给高一些（存本地不心疼，减少二次损失）
+    const candidates = [
+      { name: "H.264 (avc1.640033)", codec: "avc1.640033" },
+      { name: "VP9 (vp09.00.10.08)", codec: "vp09.00.10.08" },
+      { name: "AV1 (av01.0.08M.08)", codec: "av01.0.08M.08" },
+    ];
+    for (const c of candidates) {
+      try {
+        const res = await VideoEncoder.isConfigSupported({
+          codec: c.codec,
+          width: 2560, height: 1440,
+          bitrate: 20_000_000,       // 20Mbps，高码率压低二次损失
+          framerate: 30,
+        });
+        const hw = res.config?.hardwareAcceleration;
+        console.log(
+          `${TAG} ${res.supported ? "✓" : "✗"} 第三关 编码 ${c.name}: ` +
+          `${res.supported ? "支持" : "不支持"}${hw ? ` (${hw})` : ""}`,
+        );
+      } catch (err) {
+        console.log(`${TAG} ✗ 第三关 编码 ${c.name}: ${err.message}`);
+      }
+    }
+  }
+
   async function report() {
     if (reported) return;
     reported = true;
@@ -70,6 +103,8 @@
       console.log(`${TAG} ⚠ 未抓到 init segment —— 可能挂载太晚，` +
                   `需确认 run_at: document_start 生效`);
     }
+
+    await checkEncoders();
 
     console.log(`${TAG} 注：截到数据只是第一步。完整方案还需自建播放器` +
                 `（音视频同步/seek/字幕），且缓存超分结果受显存限制。`);

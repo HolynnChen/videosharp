@@ -113,8 +113,13 @@
   };
 
   // 定期汇总，方便在控制台一眼看到全貌
+  let lastReported = 0;
   setInterval(() => {
     if (!stats.totalChunks) return;
+    // 分片数没变化就不重复打印 —— B 站是大块预缓冲，
+    // 缓冲完成后会长时间没有新分片，每 5 秒刷一条纯属噪音
+    if (stats.totalChunks === lastReported) return;
+    lastReported = stats.totalChunks;
     const secs = ((Date.now() - stats.started) / 1000).toFixed(0);
     const lines = stats.sourceBuffers.map(
       (s) => `    ${s.isVideo ? "视频" : "音频"} ${s.mime}\n` +
